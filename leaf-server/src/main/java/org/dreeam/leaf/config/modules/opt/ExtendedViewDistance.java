@@ -6,7 +6,6 @@ import org.dreeam.leaf.config.annotations.Experimental;
 
 public class ExtendedViewDistance extends ConfigModule {
 
-    @Override
     public String basePath() {
         return ConfigCategory.PERF.basePath() + ".extended-view-distance";
     }
