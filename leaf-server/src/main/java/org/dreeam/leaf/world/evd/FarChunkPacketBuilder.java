@@ -81,7 +81,7 @@ public final class FarChunkPacketBuilder {
             int totalSize = 0;
             for (int i = 0; i < sectionCount; i++) {
                 if (sections[i] == null) {
-                    sections[i] = new LevelChunkSection(world.palettedContainerFactory());
+                    sections[i] = new LevelChunkSection(world.palettedContainerFactory(), world, data.chunkPos(), world.getSectionYFromSectionIndex(i));
                 }
                 totalSize += sections[i].getSerializedSize();
             }
