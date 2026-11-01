@@ -1,14 +1,20 @@
 package org.dreeam.leaf.world.evd;
 
 import ca.spottedleaf.moonrise.common.util.WorldUtil;
+import ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemLevel;
 import ca.spottedleaf.moonrise.patches.starlight.storage.StarlightSectionData;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.papermc.paper.antixray.ChunkPacketBlockController;
+import io.papermc.paper.configuration.type.EngineMode;
+import it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.nbt.CompoundTag;
@@ -17,14 +23,20 @@ import net.minecraft.network.protocol.game.ClientboundLevelChunkPacketData;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.network.protocol.game.ClientboundLightUpdatePacketData;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.DataLayer;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.chunk.storage.SerializableChunkData;
 import net.minecraft.world.level.levelgen.Heightmap;
+import org.dreeam.leaf.config.modules.misc.AntiFreecam;
 import org.dreeam.leaf.config.modules.opt.ExtendedViewDistance;
+import org.dreeam.leaf.world.antifreecam.EvdSurface;
+import org.dreeam.leaf.world.antifreecam.HiddenSectionWriter;
 import org.jspecify.annotations.Nullable;
 
 public final class FarChunkPacketBuilder {
@@ -78,43 +90,27 @@ public final class FarChunkPacketBuilder {
                 }
             }
 
-            int totalSize = 0;
             for (int i = 0; i < sectionCount; i++) {
                 if (sections[i] == null) {
                     sections[i] = new LevelChunkSection(world.palettedContainerFactory(), world, data.chunkPos(), world.getSectionYFromSectionIndex(i));
                 }
-                totalSize += sections[i].getSerializedSize();
             }
 
-            byte[] buffer = new byte[totalSize];
-            ByteBuf writeBuffer = Unpooled.wrappedBuffer(buffer);
-            writeBuffer.writerIndex(0);
-            FriendlyByteBuf byteBuf = new FriendlyByteBuf(writeBuffer);
-
-            for (int i = 0; i < sectionCount; i++) {
-                sections[i].write(byteBuf, null, i);
-            }
-
-            if (byteBuf.writerIndex() != totalSize) {
-                return null;
-            }
-
-            // 5. Heightmaps (only client-bound types, cloned arrays)
-            Map<Heightmap.Types, long[]> heightmaps = new EnumMap<>(Heightmap.Types.class);
+            boolean antiFreecamEnabled = AntiFreecam.isEnabled(world);
             Map<Heightmap.Types, long[]> rawHeightmaps = data.heightmaps();
-            if (rawHeightmaps != null) {
-                for (Map.Entry<Heightmap.Types, long[]> entry : rawHeightmaps.entrySet()) {
-                    if (entry.getKey().sendToClient() && entry.getValue() != null) {
-                        heightmaps.put(entry.getKey(), entry.getValue().clone());
-                    }
-                }
-            }
+            BitSet hiddenSections = antiFreecamEnabled ? EvdSurface.hiddenSections(world, rawHeightmaps) : null;
 
-            // 6. Block Entities (only if configured, up to BLOCK_ENTITY_LIMIT)
+            // 5. Block Entities (only if configured, up to BLOCK_ENTITY_LIMIT)
+            // Extracted before obfuscateNonHiddenSections so loadStatic receives the original block state (e.g. chest)
+            // rather than the replaced filler block (stone/deepslate), avoiding incompatible block entity errors.
             List<ClientboundLevelChunkPacketData.BlockEntityInfo> blockEntitiesData;
             List<CompoundTag> rawBlockEntities = data.blockEntities();
             if (ExtendedViewDistance.sendBlockEntities && rawBlockEntities != null && !rawBlockEntities.isEmpty()) {
                 blockEntitiesData = new ArrayList<>();
+                List<Block> hiddenBlocks = world.paperConfig().anticheat.antiXray.hiddenBlocks;
+                Set<Block> hiddenBlocksSet = (antiFreecamEnabled && world.chunkPacketBlockController != ChunkPacketBlockController.NO_OPERATION_INSTANCE && hiddenBlocks != null && !hiddenBlocks.isEmpty())
+                    ? new ReferenceOpenHashSet<>(hiddenBlocks)
+                    : null;
                 for (CompoundTag tag : rawBlockEntities) {
                     if (blockEntitiesData.size() >= BLOCK_ENTITY_LIMIT) {
                         break;
@@ -128,12 +124,18 @@ public final class FarChunkPacketBuilder {
                         if (sectionIndex < 0 || sectionIndex >= sectionCount) {
                             continue;
                         }
+                        if (hiddenSections != null && hiddenSections.get(sectionIndex)) {
+                            continue;
+                        }
                         LevelChunkSection section = sections[sectionIndex];
                         BlockState state = section.getBlockState(
                             SectionPos.sectionRelative(pos.getX()),
                             SectionPos.sectionRelative(pos.getY()),
                             SectionPos.sectionRelative(pos.getZ())
                         );
+                        if (hiddenBlocksSet != null && hiddenBlocksSet.contains(state.getBlock())) {
+                            continue;
+                        }
 
                         BlockEntity be = BlockEntity.loadStatic(pos, state, tag, world.registryAccess());
                         if (be != null) {
@@ -150,6 +152,27 @@ public final class FarChunkPacketBuilder {
                 }
             } else {
                 blockEntitiesData = List.of();
+            }
+
+            if (antiFreecamEnabled) {
+                // Disk path has no loaded neighbor chunk data available asynchronously;
+                // chunk boundaries are treated as exposed (matching Paper's EMPTY_SECTION = transparent behavior).
+                obfuscateNonHiddenSections(world, sections, sectionCount, hiddenSections, null, null, null, null);
+            }
+
+            byte[] buffer = serializeSections(world, sections, sectionCount, hiddenSections);
+            if (buffer == null) {
+                return null;
+            }
+
+            // 6. Heightmaps (only client-bound types, cloned arrays)
+            Map<Heightmap.Types, long[]> heightmaps = new EnumMap<>(Heightmap.Types.class);
+            if (rawHeightmaps != null) {
+                for (Map.Entry<Heightmap.Types, long[]> entry : rawHeightmaps.entrySet()) {
+                    if (entry.getKey().sendToClient() && entry.getValue() != null) {
+                        heightmaps.put(entry.getKey(), entry.getValue().clone());
+                    }
+                }
             }
 
             ClientboundLevelChunkPacketData chunkData = ClientboundLevelChunkPacketData.leaf$fromRaw(
@@ -187,16 +210,23 @@ public final class FarChunkPacketBuilder {
                 }
 
                 // Block Light
-                int blockState = ((StarlightSectionData) (Object) sd).starlight$getBlockLightState();
-                if (blockState == 1) { // INIT_STATE_UNINIT
+                int blockSectionIndex = sd.y() - minSectionY;
+                boolean isHidden = hiddenSections != null && blockSectionIndex >= 0 && blockSectionIndex < sectionCount && hiddenSections.get(blockSectionIndex);
+
+                if (isHidden) {
                     emptyBlockYMask.set(sectionIndex);
-                } else if (blockState == 2) { // INIT_STATE_INIT
-                    DataLayer blockLight = sd.blockLight();
-                    if (blockLight == null) {
-                        return null; // Corrupted light data
+                } else {
+                    int blockState = ((StarlightSectionData) (Object) sd).starlight$getBlockLightState();
+                    if (blockState == 1) { // INIT_STATE_UNINIT
+                        emptyBlockYMask.set(sectionIndex);
+                    } else if (blockState == 2) { // INIT_STATE_INIT
+                        DataLayer blockLight = sd.blockLight();
+                        if (blockLight == null) {
+                            return null; // Corrupted light data
+                        }
+                        blockYMask.set(sectionIndex);
+                        blockUpdates.add(blockLight.getData().clone());
                     }
-                    blockYMask.set(sectionIndex);
-                    blockUpdates.add(blockLight.getData().clone());
                 }
                 // blockState 0 (INIT_STATE_NULL) and 3 (INIT_STATE_HIDDEN): no entry
 
@@ -228,5 +258,320 @@ public final class FarChunkPacketBuilder {
         } catch (Throwable t) {
             return null;
         }
+    }
+
+    /**
+     * Builds a snapshot packet for a loaded chunk when Anti-Freecam is active.
+     * Must be called on the tick thread. Never modifies the live chunk.
+     */
+    public static @Nullable ClientboundLevelChunkWithLightPacket buildLive(ServerLevel world, LevelChunk live) {
+        if (world == null || live == null) {
+            return null;
+        }
+
+        try {
+            int sectionCount = world.getSectionsCount();
+            int minSectionY = world.getMinSectionY();
+            LevelChunkSection[] rawSections = live.getSections();
+            LevelChunkSection[] sections = new LevelChunkSection[sectionCount];
+
+            for (int i = 0; i < sectionCount; i++) {
+                LevelChunkSection raw = i < rawSections.length ? rawSections[i] : null;
+                if (raw == null) {
+                    sections[i] = new LevelChunkSection(world.palettedContainerFactory(), world, live.getPos(), world.getSectionYFromSectionIndex(i));
+                } else {
+                    sections[i] = raw.copy();
+                }
+            }
+
+            BitSet hiddenSections = EvdSurface.hiddenSections(live);
+
+            int chunkX = live.getPos().x();
+            int chunkZ = live.getPos().z();
+            ChunkSystemLevel chunkSystemLevel = (ChunkSystemLevel) world;
+            LevelChunk westChunk = chunkSystemLevel.moonrise$getFullChunkIfLoaded(chunkX - 1, chunkZ);
+            LevelChunk eastChunk = chunkSystemLevel.moonrise$getFullChunkIfLoaded(chunkX + 1, chunkZ);
+            LevelChunk northChunk = chunkSystemLevel.moonrise$getFullChunkIfLoaded(chunkX, chunkZ - 1);
+            LevelChunk southChunk = chunkSystemLevel.moonrise$getFullChunkIfLoaded(chunkX, chunkZ + 1);
+
+            LevelChunkSection[] westSections = westChunk != null ? westChunk.getSections() : null;
+            LevelChunkSection[] eastSections = eastChunk != null ? eastChunk.getSections() : null;
+            LevelChunkSection[] northSections = northChunk != null ? northChunk.getSections() : null;
+            LevelChunkSection[] southSections = southChunk != null ? southChunk.getSections() : null;
+
+            obfuscateNonHiddenSections(world, sections, sectionCount, hiddenSections, westSections, eastSections, northSections, southSections);
+
+            byte[] buffer = serializeSections(world, sections, sectionCount, hiddenSections);
+            if (buffer == null) {
+                return null;
+            }
+
+            // Heightmaps (only client-bound types, cloned arrays)
+            Map<Heightmap.Types, long[]> heightmaps = new EnumMap<>(Heightmap.Types.class);
+            for (Map.Entry<Heightmap.Types, Heightmap> entry : live.getHeightmaps()) {
+                if (entry.getKey().sendToClient()) {
+                    heightmaps.put(entry.getKey(), entry.getValue().getRawData().clone());
+                }
+            }
+
+            // Block Entities (only if configured, up to BLOCK_ENTITY_LIMIT)
+            List<ClientboundLevelChunkPacketData.BlockEntityInfo> blockEntitiesData;
+            if (ExtendedViewDistance.sendBlockEntities && !live.getBlockEntities().isEmpty()) {
+                blockEntitiesData = new ArrayList<>();
+                List<Block> hiddenBlocks = world.paperConfig().anticheat.antiXray.hiddenBlocks;
+                Set<Block> hiddenBlocksSet = (world.chunkPacketBlockController != ChunkPacketBlockController.NO_OPERATION_INSTANCE && hiddenBlocks != null && !hiddenBlocks.isEmpty())
+                    ? new ReferenceOpenHashSet<>(hiddenBlocks)
+                    : null;
+
+                for (BlockEntity be : live.getBlockEntities().values()) {
+                    if (blockEntitiesData.size() >= BLOCK_ENTITY_LIMIT) {
+                        break;
+                    }
+                    BlockPos pos = be.getBlockPos();
+                    if (world.isOutsideBuildHeight(pos)) {
+                        continue;
+                    }
+                    int sectionIndex = world.getSectionIndex(pos.getY());
+                    if (sectionIndex < 0 || sectionIndex >= sectionCount) {
+                        continue;
+                    }
+                    if (hiddenSections != null && hiddenSections.get(sectionIndex)) {
+                        continue;
+                    }
+                    if (hiddenBlocksSet != null && hiddenBlocksSet.contains(be.getBlockState().getBlock())) {
+                        continue;
+                    }
+
+                    CompoundTag updateTag = be.getUpdateTag(world.registryAccess());
+                    be.sanitizeSentNbt(updateTag);
+                    blockEntitiesData.add(ClientboundLevelChunkPacketData.leaf$blockEntityInfo(pos, be.getType(), updateTag));
+                }
+                if (blockEntitiesData.isEmpty()) {
+                    blockEntitiesData = List.of();
+                }
+            } else {
+                blockEntitiesData = List.of();
+            }
+
+            ClientboundLevelChunkPacketData chunkData = ClientboundLevelChunkPacketData.leaf$fromRaw(
+                heightmaps, buffer, blockEntitiesData
+            );
+
+            // Light from light engine with hidden sections block light sent as empty
+            ClientboundLightUpdatePacketData lightData = new ClientboundLightUpdatePacketData(
+                live.getPos(), world.getLightEngine(), null, null, hiddenSections
+            );
+
+            return new ClientboundLevelChunkWithLightPacket(live.getPos().x(), live.getPos().z(), chunkData, lightData);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static byte @Nullable [] serializeSections(
+        ServerLevel world,
+        LevelChunkSection[] sections,
+        int sectionCount,
+        @Nullable BitSet hiddenSections
+    ) {
+        int totalSize = 0;
+        for (int i = 0; i < sectionCount; i++) {
+            if (hiddenSections != null && hiddenSections.get(i)) {
+                totalSize += HiddenSectionWriter.serializedSize(world, sections[i], world.getSectionYFromSectionIndex(i));
+            } else {
+                totalSize += sections[i].getSerializedSize();
+            }
+        }
+
+        byte[] buffer = new byte[totalSize];
+        ByteBuf writeBuffer = Unpooled.wrappedBuffer(buffer);
+        writeBuffer.writerIndex(0);
+        FriendlyByteBuf byteBuf = new FriendlyByteBuf(writeBuffer);
+
+        for (int i = 0; i < sectionCount; i++) {
+            if (hiddenSections != null && hiddenSections.get(i)) {
+                HiddenSectionWriter.write(byteBuf, world, sections[i], world.getSectionYFromSectionIndex(i));
+            } else {
+                sections[i].write(byteBuf, null, i);
+            }
+        }
+
+        if (byteBuf.writerIndex() != totalSize) {
+            return null;
+        }
+        return buffer;
+    }
+
+    private static void obfuscateNonHiddenSections(
+        ServerLevel world,
+        LevelChunkSection[] sections,
+        int sectionCount,
+        @Nullable BitSet hiddenSections,
+        @Nullable LevelChunkSection[] westSections,
+        @Nullable LevelChunkSection[] eastSections,
+        @Nullable LevelChunkSection[] northSections,
+        @Nullable LevelChunkSection[] southSections
+    ) {
+        if (world.chunkPacketBlockController == ChunkPacketBlockController.NO_OPERATION_INSTANCE) {
+            return;
+        }
+
+        var antiXray = world.paperConfig().anticheat.antiXray;
+        List<Block> hiddenBlocks = antiXray.hiddenBlocks;
+        Set<Block> hiddenBlocksSet = (hiddenBlocks != null && !hiddenBlocks.isEmpty())
+            ? new ReferenceOpenHashSet<>(hiddenBlocks)
+            : null;
+
+        boolean isObfuscateMode = antiXray.engineMode == EngineMode.OBFUSCATE || antiXray.engineMode == EngineMode.OBFUSCATE_LAYER;
+        List<Block> replacementBlocks = isObfuscateMode ? antiXray.replacementBlocks : null;
+        Set<Block> replacementBlocksSet = (replacementBlocks != null && !replacementBlocks.isEmpty())
+            ? new ReferenceOpenHashSet<>(replacementBlocks)
+            : null;
+
+        if (hiddenBlocksSet == null && replacementBlocksSet == null) {
+            return;
+        }
+
+        boolean lavaObscures = antiXray.lavaObscures;
+
+        Predicate<BlockState> paletteCheck;
+        if (hiddenBlocksSet != null && replacementBlocksSet != null) {
+            paletteCheck = state -> {
+                Block b = state.getBlock();
+                return hiddenBlocksSet.contains(b) || replacementBlocksSet.contains(b);
+            };
+        } else if (hiddenBlocksSet != null) {
+            paletteCheck = state -> hiddenBlocksSet.contains(state.getBlock());
+        } else {
+            paletteCheck = state -> replacementBlocksSet.contains(state.getBlock());
+        }
+
+        for (int i = 0; i < sectionCount; i++) {
+            if (hiddenSections != null && hiddenSections.get(i)) {
+                continue;
+            }
+            LevelChunkSection section = sections[i];
+            if (section == null || !section.maybeHas(paletteCheck)) {
+                continue;
+            }
+
+            BlockState filler = HiddenSectionWriter.filler(world, world.getSectionYFromSectionIndex(i));
+            for (int y = 0; y < 16; y++) {
+                for (int z = 0; z < 16; z++) {
+                    for (int x = 0; x < 16; x++) {
+                        BlockState state = section.getBlockState(x, y, z);
+                        Block block = state.getBlock();
+                        if (hiddenBlocksSet != null && hiddenBlocksSet.contains(block)) {
+                            section.setBlockState(x, y, z, filler, false);
+                        } else if (replacementBlocksSet != null && replacementBlocksSet.contains(block)) {
+                            if (isEnclosed(sections, i, sectionCount, x, y, z, lavaObscures, westSections, eastSections, northSections, southSections)) {
+                                section.setBlockState(x, y, z, filler, false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static boolean isEnclosed(
+        LevelChunkSection[] sections,
+        int sectionIndex,
+        int sectionCount,
+        int x,
+        int y,
+        int z,
+        boolean lavaObscures,
+        @Nullable LevelChunkSection[] westSections,
+        @Nullable LevelChunkSection[] eastSections,
+        @Nullable LevelChunkSection[] northSections,
+        @Nullable LevelChunkSection[] southSections
+    ) {
+        // Check X - 1 (West)
+        BlockState westState;
+        if (x > 0) {
+            westState = sections[sectionIndex].getBlockState(x - 1, y, z);
+        } else if (westSections != null && sectionIndex < westSections.length && westSections[sectionIndex] != null) {
+            westState = westSections[sectionIndex].getBlockState(15, y, z);
+        } else {
+            return false; // Neighbor chunk not loaded / disk path without neighbor data -> treated as exposed
+        }
+        if (isTransparent(westState, lavaObscures)) {
+            return false;
+        }
+
+        // Check X + 1 (East)
+        BlockState eastState;
+        if (x < 15) {
+            eastState = sections[sectionIndex].getBlockState(x + 1, y, z);
+        } else if (eastSections != null && sectionIndex < eastSections.length && eastSections[sectionIndex] != null) {
+            eastState = eastSections[sectionIndex].getBlockState(0, y, z);
+        } else {
+            return false;
+        }
+        if (isTransparent(eastState, lavaObscures)) {
+            return false;
+        }
+
+        // Check Z - 1 (North)
+        BlockState northState;
+        if (z > 0) {
+            northState = sections[sectionIndex].getBlockState(x, y, z - 1);
+        } else if (northSections != null && sectionIndex < northSections.length && northSections[sectionIndex] != null) {
+            northState = northSections[sectionIndex].getBlockState(x, y, 15);
+        } else {
+            return false;
+        }
+        if (isTransparent(northState, lavaObscures)) {
+            return false;
+        }
+
+        // Check Z + 1 (South)
+        BlockState southState;
+        if (z < 15) {
+            southState = sections[sectionIndex].getBlockState(x, y, z + 1);
+        } else if (southSections != null && sectionIndex < southSections.length && southSections[sectionIndex] != null) {
+            southState = southSections[sectionIndex].getBlockState(x, y, 0);
+        } else {
+            return false;
+        }
+        if (isTransparent(southState, lavaObscures)) {
+            return false;
+        }
+
+        // Check Y - 1 (down)
+        BlockState downState;
+        if (y > 0) {
+            downState = sections[sectionIndex].getBlockState(x, y - 1, z);
+        } else if (sectionIndex > 0 && sections[sectionIndex - 1] != null) {
+            downState = sections[sectionIndex - 1].getBlockState(x, 15, z);
+        } else {
+            return false; // Below world -> exposed
+        }
+        if (isTransparent(downState, lavaObscures)) {
+            return false;
+        }
+
+        // Check Y + 1 (up)
+        BlockState upState;
+        if (y < 15) {
+            upState = sections[sectionIndex].getBlockState(x, y + 1, z);
+        } else if (sectionIndex < sectionCount - 1 && sections[sectionIndex + 1] != null) {
+            upState = sections[sectionIndex + 1].getBlockState(x, 0, z);
+        } else {
+            return false; // Above world -> exposed
+        }
+        return !isTransparent(upState, lavaObscures);
+    }
+
+    private static boolean isTransparent(@Nullable BlockState state, boolean lavaObscures) {
+        if (state == null || state.isAir()) {
+            return true;
+        }
+        if (lavaObscures && state.is(Blocks.LAVA)) {
+            return false;
+        }
+        return !state.canOcclude() || !state.isSolidRender()
+            || state.is(Blocks.BARRIER) || state.is(Blocks.SPAWNER) || state.is(Blocks.SHULKER_BOX) || state.is(Blocks.SLIME_BLOCK);
     }
 }

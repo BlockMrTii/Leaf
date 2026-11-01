@@ -1,0 +1,742 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: BlockMrTii <134159440+BlockMrTii@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 00:16:20 +0100
+Subject: [PATCH] Anti-freecam
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+index a59fa545ac8b82029693f46b91927dcf4d7ab707..90c2a9d81ecc336327a69651d276600662a9fe8b 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+@@ -310,6 +310,7 @@ public final class RegionizedPlayerChunkLoader {
+         TickThread.ensureTickThread("Cannot tick player chunk loader async");
+         long currTime = System.nanoTime();
+         this.leaf$farChunkManager.tick(); // Leaf - Extended view distance
++        org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.tick(this.world); // Leaf - Anti-freecam
+         for (final ServerPlayer player : new java.util.ArrayList<>(this.world.players())) {
+             final PlayerChunkLoaderData loader = ((ChunkSystemServerPlayer)player).moonrise$getChunkLoader();
+             if (loader == null || loader.removed || loader.world != this.world) {
+@@ -473,6 +474,7 @@ public final class RegionizedPlayerChunkLoader {
+             // Note: drop isAlive() check so that chunks properly unload client-side when the player dies
+             ((ChunkSystemChunkHolder)((ChunkSystemServerLevel)this.world).moonrise$getChunkTaskScheduler().chunkHolderManager
+                 .getChunkHolder(chunkX, chunkZ).vanillaChunkHolder).moonrise$removeReceivedChunk(this.player);
++            org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.onChunkForget(this.world, this.player, chunkX, chunkZ); // Leaf - Anti-freecam - the chunk is no longer live for the player, even if retained as snapshot
+             if (!this.farTracker.retainOnUnload(chunkX, chunkZ)) { // Leaf - Extended view distance - keep as snapshot inside the far ring
+             this.player.connection.send(new ClientboundForgetLevelChunkPacket(new ChunkPos(chunkX, chunkZ)));
+             } // Leaf - Extended view distance
+@@ -1107,6 +1109,7 @@ public final class RegionizedPlayerChunkLoader {
+             this.farTracker.remove(); // Leaf - Extended view distance - also stops snapshot retention for the unloads below
+             // sends the chunk unload packets
+             this.broadcastMap.remove();
++            org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.onPlayerRemoved(this.world, this.player); // Leaf - Anti-freecam
+             // cleans up loading/generating tickets
+             this.loadTicketCleanup.remove();
+             // cleans up ticking tickets
+diff --git a/io/papermc/paper/FeatureHooks.java b/io/papermc/paper/FeatureHooks.java
+index c3025e2d66b2b7894483c91295ef6de6c0edce5c..523d31297b63822dfb20302bde07133a321483e3 100644
+--- a/io/papermc/paper/FeatureHooks.java
++++ b/io/papermc/paper/FeatureHooks.java
+@@ -56,6 +56,14 @@ public final class FeatureHooks {
+         for (final ServerPlayer player : playersInRange) {
+             if (player.connection == null) continue;
+ 
++            // Leaf start - Anti-freecam - packets with hidden sections are per player
++            final org.dreeam.leaf.world.antifreecam.SendMasks masks = org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.onChunkSend(player, chunk);
++            if (masks != null) {
++                player.connection.send(new ClientboundLevelChunkWithLightPacket(chunk, chunk.getLevel().getLightEngine(), null, null, chunk.getLevel().chunkPacketBlockController.shouldModify(player, chunk), masks.hidden(), masks.partial()));
++                continue;
++            }
++            // Leaf end - Anti-freecam
++
+             final Boolean shouldModify = chunk.getLevel().chunkPacketBlockController.shouldModify(player, chunk);
+             player.connection.send(refreshPackets.computeIfAbsent(shouldModify, s -> { // Use connection to prevent creating firing event
+                 return new ClientboundLevelChunkWithLightPacket(chunk, chunk.getLevel().getLightEngine(), null, null, (Boolean) s);
+diff --git a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
+index 7e0dc439ec15ad81ef0d3c97d4fe4cc35a762453..934f05ae7e72f49f18374f21cd0868661723faff 100644
+--- a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
++++ b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
+@@ -68,6 +68,19 @@ public class ClientboundLevelChunkPacketData {
+     }
+     public ClientboundLevelChunkPacketData(final LevelChunk levelChunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo) {
+         // Paper end - Anti-Xray - Add chunk packet info
++        // Leaf start - Anti-freecam
++        this(levelChunk, chunkPacketInfo, null);
++    }
++
++    public ClientboundLevelChunkPacketData(final LevelChunk levelChunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, final java.util.@Nullable BitSet hiddenSections) {
++        this(levelChunk, chunkPacketInfo, hiddenSections, null);
++    }
++
++    public ClientboundLevelChunkPacketData(final LevelChunk levelChunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, final java.util.@Nullable BitSet hiddenSections, final java.util.@Nullable BitSet partialSections) {
++        // serialized partially culled sections, null entries are sent real
++        final byte[][] partialData = leaf$preparePartial(levelChunk, partialSections);
++        final org.dreeam.leaf.world.antifreecam.@Nullable PartialCulling partialCulling = partialData == null ? null : ((net.minecraft.server.level.ServerLevel)levelChunk.getLevel()).leaf$partialCulling;
++        // Leaf end - Anti-freecam
+         // Leaf start - Optimize chunk packet construction
+         this.heightmaps = new java.util.EnumMap<>(Heightmap.Types.class);
+         for (final Entry<Heightmap.Types, Heightmap> entry : levelChunk.getHeightmaps()) {
+@@ -76,16 +89,31 @@ public class ClientboundLevelChunkPacketData {
+             }
+         }
+         // Leaf end - Optimize chunk packet construction
+-        this.buffer = new byte[calculateChunkSize(levelChunk)];
++        this.buffer = new byte[calculateChunkSize(levelChunk, hiddenSections, partialData)]; // Leaf - Anti-freecam
+         // Paper start - Anti-Xray - Add chunk packet info
+         if (chunkPacketInfo != null) {
+             chunkPacketInfo.setBuffer(this.buffer);
+         }
+-        extractChunkData(new FriendlyByteBuf(this.getWriteBuffer()), levelChunk, chunkPacketInfo);
++        extractChunkData(new FriendlyByteBuf(this.getWriteBuffer()), levelChunk, chunkPacketInfo, hiddenSections, partialData); // Leaf - Anti-freecam
+         this.blockEntitiesData = Lists.newArrayList();
+         int totalTileEntities = 0; // Paper - Handle oversized block entities in chunks
+ 
+         for (final BlockEntity blockEntity : levelChunk.getBlockEntities().values()) { // Leaf - Optimize chunk packet construction
++            // Leaf start - Anti-freecam - never send block entities of hidden sections
++            if (hiddenSections != null) {
++                final int sectionIndex = levelChunk.getSectionIndex(blockEntity.getBlockPos().getY());
++                if (sectionIndex >= 0 && hiddenSections.get(sectionIndex)) {
++                    continue;
++                }
++            }
++            if (partialCulling != null) {
++                final BlockPos pos = blockEntity.getBlockPos();
++                final int sectionIndex = levelChunk.getSectionIndex(pos.getY());
++                if (sectionIndex >= 0 && sectionIndex < partialData.length && partialData[sectionIndex] != null && partialCulling.isCulled(pos.getX(), pos.getY(), pos.getZ())) {
++                    continue;
++                }
++            }
++            // Leaf end - Anti-freecam
+             // Paper start - Handle oversized block entities in chunks
+             if (++totalTileEntities > BLOCK_ENTITY_LIMIT) {
+                 net.minecraft.network.protocol.Packet<ClientGamePacketListener> packet = blockEntity.getUpdatePacket(); // Leaf - Optimize chunk packet construction
+@@ -124,12 +152,45 @@ public class ClientboundLevelChunkPacketData {
+     }
+     // Leaf end - Extended view distance
+ 
+-    private static int calculateChunkSize(final LevelChunk chunk) {
++    // Leaf start - Anti-freecam
++    private static byte @Nullable [][] leaf$preparePartial(final LevelChunk chunk, final java.util.@Nullable BitSet partialSections) {
++        if (partialSections == null || partialSections.isEmpty()) {
++            return null;
++        }
++        final net.minecraft.server.level.ServerLevel level = (net.minecraft.server.level.ServerLevel)chunk.getLevel();
++        final org.dreeam.leaf.world.antifreecam.PartialCulling culling = org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.partialCulling(level);
++        final long tick = level.getServer().getTickCount();
++        final int sectionCount = chunk.getSectionsCount();
++        byte[][] ret = null;
++        for (int i = partialSections.nextSetBit(0); i >= 0 && i < sectionCount; i = partialSections.nextSetBit(i + 1)) {
++            final byte[] data = culling.serialize(chunk, i, tick);
++            if (data != null) {
++                if (ret == null) {
++                    ret = new byte[sectionCount][];
++                }
++                ret[i] = data;
++            }
++        }
++        return ret;
++    }
++    // Leaf end - Anti-freecam
++
++    private static int calculateChunkSize(final LevelChunk chunk, final java.util.@Nullable BitSet hiddenSections, final byte @Nullable [][] partialData) { // Leaf - Anti-freecam
+         int total = 0;
+ 
+-        for (LevelChunkSection section : chunk.getSections()) {
+-            total += section.getSerializedSize();
++        // Leaf start - Anti-freecam
++        final LevelChunkSection[] sections = chunk.getSections();
++        for (int i = 0; i < sections.length; ++i) {
++            final LevelChunkSection section = sections[i];
++            if (hiddenSections != null && hiddenSections.get(i)) {
++                total += org.dreeam.leaf.world.antifreecam.HiddenSectionWriter.serializedSize(chunk.getLevel(), section, chunk.getSectionYFromSectionIndex(i));
++            } else if (partialData != null && partialData[i] != null) {
++                total += partialData[i].length;
++            } else {
++                total += section.getSerializedSize();
++            }
+         }
++        // Leaf end - Anti-freecam
+ 
+         return total;
+     }
+@@ -146,8 +207,25 @@ public class ClientboundLevelChunkPacketData {
+         extractChunkData(buffer, chunk, null);
+     }
+     public static void extractChunkData(final FriendlyByteBuf buffer, final LevelChunk chunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo) {
++        // Leaf start - Anti-freecam
++        extractChunkData(buffer, chunk, chunkPacketInfo, null);
++    }
++
++    public static void extractChunkData(final FriendlyByteBuf buffer, final LevelChunk chunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, final java.util.@Nullable BitSet hiddenSections) {
++        extractChunkData(buffer, chunk, chunkPacketInfo, hiddenSections, null);
++    }
++
++    private static void extractChunkData(final FriendlyByteBuf buffer, final LevelChunk chunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, final java.util.@Nullable BitSet hiddenSections, final byte @Nullable [][] partialData) {
++        // Leaf end - Anti-freecam
+         int chunkSectionIndex = 0;
+         for (LevelChunkSection section : chunk.getSections()) {
++            // Leaf start - Anti-freecam - hidden and partial sections are written without chunk packet info, so Anti-Xray skips them
++            if (hiddenSections != null && hiddenSections.get(chunkSectionIndex)) {
++                org.dreeam.leaf.world.antifreecam.HiddenSectionWriter.write(buffer, chunk.getLevel(), section, chunk.getSectionYFromSectionIndex(chunkSectionIndex));
++            } else if (partialData != null && partialData[chunkSectionIndex] != null) {
++                buffer.writeBytes(partialData[chunkSectionIndex]);
++            } else
++            // Leaf end - Anti-freecam
+             section.write(buffer, chunkPacketInfo, chunkSectionIndex);
+             chunkSectionIndex++;
+             // Paper end - Anti-Xray - Add chunk packet info
+diff --git a/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java b/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
+index 1b83d541378c98e3517904973e3ea4e33098a914..58107f8283d3bb2723506468c7bd9b3435603e7c 100644
+--- a/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
++++ b/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
+@@ -53,13 +53,43 @@ public record ClientboundLevelChunkWithLightPacket(int x, int z, ClientboundLeve
+         final boolean modifyBlocks
+     ) {
+         // Paper end - Anti-Xray
++        // Leaf start - Anti-freecam
++        this(levelChunk, lightEngine, skyChangedLightSectionFilter, blockChangedLightSectionFilter, modifyBlocks, null, null);
++    }
++
++    public ClientboundLevelChunkWithLightPacket(
++        final LevelChunk levelChunk,
++        final LevelLightEngine lightEngine,
++        final @Nullable BitSet skyChangedLightSectionFilter,
++        final @Nullable BitSet blockChangedLightSectionFilter,
++        final boolean modifyBlocks,
++        final @Nullable BitSet hiddenSections
++    ) {
++        this(levelChunk, lightEngine, skyChangedLightSectionFilter, blockChangedLightSectionFilter, modifyBlocks, hiddenSections, null);
++    }
++
++    /**
++     * @param hiddenSections section indices sent as filler without block entities and block light, or {@code null}
++     * @param partialSections section indices whose dark cells are sent as filler, without block light and without the
++     *                        block entities of culled cells, or {@code null}
++     */
++    public ClientboundLevelChunkWithLightPacket(
++        final LevelChunk levelChunk,
++        final LevelLightEngine lightEngine,
++        final @Nullable BitSet skyChangedLightSectionFilter,
++        final @Nullable BitSet blockChangedLightSectionFilter,
++        final boolean modifyBlocks,
++        final @Nullable BitSet hiddenSections,
++        final @Nullable BitSet partialSections
++    ) {
++        // Leaf end - Anti-freecam
+         ChunkPos chunkPos = levelChunk.getPos();
+         io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo = modifyBlocks ? levelChunk.getLevel().chunkPacketBlockController.getChunkPacketInfo(levelChunk) : null; // Paper - Anti-Xray
+         this(
+             chunkPos.x(),
+             chunkPos.z(),
+-            new ClientboundLevelChunkPacketData(levelChunk, chunkPacketInfo), // Paper - Anti-Xray
+-            new ClientboundLightUpdatePacketData(chunkPos, lightEngine, skyChangedLightSectionFilter, blockChangedLightSectionFilter)
++            new ClientboundLevelChunkPacketData(levelChunk, chunkPacketInfo, hiddenSections, partialSections), // Paper - Anti-Xray // Leaf - Anti-freecam
++            new ClientboundLightUpdatePacketData(chunkPos, lightEngine, skyChangedLightSectionFilter, blockChangedLightSectionFilter, hiddenSections, org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.partialMasks(levelChunk, partialSections)) // Leaf - Anti-freecam
+         );
+         // Paper start - Anti-Xray - Modify blocks
+         if (chunkPacketInfo != null) {
+diff --git a/net/minecraft/network/protocol/game/ClientboundLightUpdatePacketData.java b/net/minecraft/network/protocol/game/ClientboundLightUpdatePacketData.java
+index 4b09b2c0822cb9293560aeaf5ed1de7d2eb283e6..5f0e9be04b8eb2289e97ff73fb664b20ae38b0a2 100644
+--- a/net/minecraft/network/protocol/game/ClientboundLightUpdatePacketData.java
++++ b/net/minecraft/network/protocol/game/ClientboundLightUpdatePacketData.java
+@@ -47,6 +47,37 @@ public record ClientboundLightUpdatePacketData(
+         final @Nullable BitSet skyChangedLightSectionFilter,
+         final @Nullable BitSet blockChangedLightSectionFilter
+     ) {
++        // Leaf start - Anti-freecam
++        this(chunkPos, lightEngine, skyChangedLightSectionFilter, blockChangedLightSectionFilter, null);
++    }
++
++    /**
++     * @param hiddenSections block section indices (not light section indices) whose block light is sent as empty
++     */
++    public ClientboundLightUpdatePacketData(
++        final ChunkPos chunkPos,
++        final LevelLightEngine lightEngine,
++        final @Nullable BitSet skyChangedLightSectionFilter,
++        final @Nullable BitSet blockChangedLightSectionFilter,
++        final @Nullable BitSet hiddenSections
++    ) {
++        this(chunkPos, lightEngine, skyChangedLightSectionFilter, blockChangedLightSectionFilter, hiddenSections, null);
++    }
++
++    /**
++     * @param partialMasks culled cells per block section index, their block light is sent as 0; {@code null} entries are sent unchanged
++     */
++    public ClientboundLightUpdatePacketData(
++        final ChunkPos chunkPos,
++        final LevelLightEngine lightEngine,
++        final @Nullable BitSet skyChangedLightSectionFilter,
++        final @Nullable BitSet blockChangedLightSectionFilter,
++        final @Nullable BitSet hiddenSections,
++        final long @Nullable [][] partialMasks
++    ) {
++        // light sections start one section below the world, see LevelLightEngine#getMinLightSection
++        final int hiddenOffset = 1;
++        // Leaf end - Anti-freecam
+         // Leaf start - Rewrite ClientboundLightUpdatePacketData
+         int sectionCount = lightEngine.getLightSectionCount();
+         int longWords = (sectionCount + 63) >>> 6;
+@@ -80,10 +111,16 @@ public record ClientboundLightUpdatePacketData(
+             if (blockChangedLightSectionFilter == null || blockChangedLightSectionFilter.get(sectionIndex)) {
+                 DataLayer blockData = blockLayerListener.getDataLayerData(sectionPos);
+                 if (blockData != null) {
+-                    if (blockData.isEmpty()) {
++                    if (blockData.isEmpty() || (hiddenSections != null && sectionIndex >= hiddenOffset && hiddenSections.get(sectionIndex - hiddenOffset))) { // Leaf - Anti-freecam
+                         emptyBlockYMask.set(sectionIndex);
+                     } else {
+                         blockYMask.set(sectionIndex);
++                        // Leaf start - Anti-freecam - no block light in culled cells of partial sections
++                        final int blockSection = sectionIndex - hiddenOffset;
++                        if (partialMasks != null && blockSection >= 0 && blockSection < partialMasks.length && partialMasks[blockSection] != null) {
++                            blockBuffer[blockCount++] = org.dreeam.leaf.world.antifreecam.PartialCulling.maskBlockLight(blockData.getData(), partialMasks[blockSection]);
++                        } else
++                        // Leaf end - Anti-freecam
+                         blockBuffer[blockCount++] = blockData.getData();
+                     }
+                 }
+diff --git a/net/minecraft/server/level/ChunkHolder.java b/net/minecraft/server/level/ChunkHolder.java
+index cd5a325d37f617431ceb568a655701601618198f..9298c9fd010e78f2ca7038f15ec60de1f718b176 100644
+--- a/net/minecraft/server/level/ChunkHolder.java
++++ b/net/minecraft/server/level/ChunkHolder.java
+@@ -277,6 +277,19 @@ public class ChunkHolder extends GenerationChunkHolder implements ca.spottedleaf
+             Level level = chunk.getLevel();
+             if (!this.skyChangedLightSectionFilter.isEmpty() || !this.blockChangedLightSectionFilter.isEmpty()) {
+                 List<ServerPlayer> borderPlayers = this.moonrise$getPlayers(true); // Paper - rewrite chunk system
++                // Leaf start - Anti-freecam - block light of masked sections must not reach the player
++                final org.dreeam.leaf.world.antifreecam.AntiFreecamManager antiFreecam = ((ServerLevel)level).leaf$antiFreecam;
++                if (antiFreecam != null && !this.skyChangedLightSectionFilter.isEmpty()) {
++                    // culled cells of partial sections follow the sky light, holders get the chunk again if they change
++                    final int minLightSection = this.levelHeightAccessor.getMinSectionY() - 1;
++                    for (int lightIndex = this.skyChangedLightSectionFilter.nextSetBit(0); lightIndex >= 0; lightIndex = this.skyChangedLightSectionFilter.nextSetBit(lightIndex + 1)) {
++                        org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.onSkyLightChanged((ServerLevel)level, chunk.getPos().x(), minLightSection + lightIndex, chunk.getPos().z());
++                    }
++                }
++                if (antiFreecam != null && !borderPlayers.isEmpty() && !this.blockChangedLightSectionFilter.isEmpty()) {
++                    borderPlayers = this.leaf$broadcastFilteredLight(antiFreecam, borderPlayers, chunk);
++                }
++                // Leaf end - Anti-freecam
+                 if (!borderPlayers.isEmpty()) {
+                     ClientboundLightUpdatePacket lightPacket = new ClientboundLightUpdatePacket(
+                         chunk.getPos(), this.lightEngine, this.skyChangedLightSectionFilter, this.blockChangedLightSectionFilter
+@@ -289,12 +302,18 @@ public class ChunkHolder extends GenerationChunkHolder implements ca.spottedleaf
+             }
+ 
+             if (this.hasChangedSections) {
+-                List<ServerPlayer> players = this.moonrise$getPlayers(false); // Paper - rewrite chunk system
++                List<ServerPlayer> allPlayers = this.moonrise$getPlayers(false); // Paper - rewrite chunk system // Leaf - Anti-freecam
++                final org.dreeam.leaf.world.antifreecam.AntiFreecamManager antiFreecam = ((ServerLevel)level).leaf$antiFreecam; // Leaf - Anti-freecam
+ 
+                 for (int sectionIndex = 0; sectionIndex < this.changedBlocksPerSection.length; sectionIndex++) {
+                     ShortSet changedBlocks = this.changedBlocksPerSection[sectionIndex];
+                     if (changedBlocks != null) {
+                         this.changedBlocksPerSection[sectionIndex] = null;
++                        // Leaf start - Anti-freecam - updates of masked sections are dropped, the reveal resends the whole chunk
++                        final List<ServerPlayer> players = antiFreecam == null || allPlayers.isEmpty()
++                            ? allPlayers
++                            : this.leaf$withoutMasked(antiFreecam, allPlayers, chunk.getPos().x(), this.levelHeightAccessor.getSectionYFromSectionIndex(sectionIndex), chunk.getPos().z());
++                        // Leaf end - Anti-freecam
+                         if (!players.isEmpty()) {
+                             int sectionY = this.levelHeightAccessor.getSectionYFromSectionIndex(sectionIndex);
+                             SectionPos sectionPos = SectionPos.of(chunk.getPos(), sectionY);
+@@ -310,13 +329,184 @@ public class ChunkHolder extends GenerationChunkHolder implements ca.spottedleaf
+                                 packet.runUpdates((pos, state) -> this.broadcastBlockEntityIfNeeded(players, level, pos, state));
+                             }
+                         }
++                        // Leaf start - Anti-freecam - players with a partially culled section only get the updates of real cells
++                        if (antiFreecam != null && !allPlayers.isEmpty()) {
++                            this.leaf$broadcastPartial(antiFreecam, allPlayers, level, chunk, sectionIndex, changedBlocks);
++                        }
++                        // Leaf end - Anti-freecam
+                     }
+                 }
+ 
+                 this.hasChangedSections = false;
+             }
++            // Leaf start - Anti-freecam - do not retain players in the reused list
++            if (this.leaf$filteredPlayers != null) {
++                this.leaf$filteredPlayers.clear();
++            }
++            // Leaf end - Anti-freecam
++        }
++    }
++
++    // Leaf start - Anti-freecam
++    // reused on the tick thread, only the sections the client got as filler are filtered: updates of real but
++    // currently unreachable sections must still arrive, they are not resent if the player comes back in time
++    private it.unimi.dsi.fastutil.objects.@org.jspecify.annotations.Nullable ObjectArrayList<ServerPlayer> leaf$filteredPlayers;
++    private java.util.@org.jspecify.annotations.Nullable BitSet leaf$filteredLight;
++
++    private static boolean leaf$isFiltered(final org.dreeam.leaf.world.antifreecam.AntiFreecamManager antiFreecam, final ServerPlayer player, final int chunkX, final int sectionY, final int chunkZ) {
++        return antiFreecam.isSectionMasked(player, chunkX, sectionY, chunkZ) || antiFreecam.isSectionPartial(player, chunkX, sectionY, chunkZ);
++    }
++
++    private void leaf$broadcastPartial(final org.dreeam.leaf.world.antifreecam.AntiFreecamManager antiFreecam, final List<ServerPlayer> players, final Level level, final LevelChunk chunk, final int sectionIndex, final ShortSet changedBlocks) {
++        final int chunkX = chunk.getPos().x();
++        final int chunkZ = chunk.getPos().z();
++        final int sectionY = this.levelHeightAccessor.getSectionYFromSectionIndex(sectionIndex);
++        it.unimi.dsi.fastutil.shorts.ShortArraySet visible = null;
++        it.unimi.dsi.fastutil.objects.ObjectArrayList<ServerPlayer> receivers = null;
++        boolean computed = false;
++        final SectionPos sectionPos = SectionPos.of(chunk.getPos(), sectionY);
++        for (int i = 0, len = players.size(); i < len; ++i) {
++            final ServerPlayer player = players.get(i);
++            if (antiFreecam.isSectionMasked(player, chunkX, sectionY, chunkZ) || !antiFreecam.isSectionPartial(player, chunkX, sectionY, chunkZ)) {
++                continue;
++            }
++            if (!computed) {
++                // the culled cells are the same for every player, only allocated when a partial section changed
++                computed = true;
++                final org.dreeam.leaf.world.antifreecam.PartialCulling culling = org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.partialCulling((ServerLevel)level);
++                for (final it.unimi.dsi.fastutil.shorts.ShortIterator iterator = changedBlocks.iterator(); iterator.hasNext();) {
++                    final short packed = iterator.nextShort();
++                    final BlockPos pos = sectionPos.relativeToBlockPos(packed);
++                    if (!culling.isCulled(pos.getX(), pos.getY(), pos.getZ())) {
++                        if (visible == null) {
++                            visible = new it.unimi.dsi.fastutil.shorts.ShortArraySet();
++                        }
++                        visible.add(packed);
++                    }
++                }
++            }
++            if (visible == null) {
++                return;
++            }
++            if (receivers == null) {
++                receivers = new it.unimi.dsi.fastutil.objects.ObjectArrayList<>(2);
++            }
++            receivers.add(player);
++        }
++        if (receivers == null) {
++            return;
++        }
++        // built once for all players holding the section partially culled
++        if (visible.size() == 1) {
++            final BlockPos pos = sectionPos.relativeToBlockPos(visible.iterator().nextShort());
++            final BlockState state = level.getBlockState(pos);
++            this.broadcast(receivers, new ClientboundBlockUpdatePacket(pos, state));
++            this.broadcastBlockEntityIfNeeded(receivers, level, pos, state);
++        } else {
++            final ClientboundSectionBlocksUpdatePacket packet = new ClientboundSectionBlocksUpdatePacket(sectionPos, visible, chunk.getSection(sectionIndex));
++            this.broadcast(receivers, packet);
++            final List<ServerPlayer> finalReceivers = receivers;
++            packet.runUpdates((pos, state) -> this.broadcastBlockEntityIfNeeded(finalReceivers, level, pos, state));
++        }
++    }
++
++    private it.unimi.dsi.fastutil.objects.ObjectArrayList<ServerPlayer> leaf$filteredPlayers() {
++        it.unimi.dsi.fastutil.objects.ObjectArrayList<ServerPlayer> ret = this.leaf$filteredPlayers;
++        if (ret == null) {
++            this.leaf$filteredPlayers = ret = new it.unimi.dsi.fastutil.objects.ObjectArrayList<>();
++        }
++        ret.clear();
++        return ret;
++    }
++
++    /**
++     * @return {@code players} if nobody is filtered, otherwise a reused list that is valid until the next call
++     */
++    private List<ServerPlayer> leaf$withoutMasked(final org.dreeam.leaf.world.antifreecam.AntiFreecamManager antiFreecam, final List<ServerPlayer> players, final int chunkX, final int sectionY, final int chunkZ) {
++        it.unimi.dsi.fastutil.objects.ObjectArrayList<ServerPlayer> ret = null;
++        for (int i = 0, len = players.size(); i < len; ++i) {
++            final ServerPlayer player = players.get(i);
++            if (leaf$isFiltered(antiFreecam, player, chunkX, sectionY, chunkZ)) {
++                if (ret == null) {
++                    ret = this.leaf$filteredPlayers();
++                    for (int j = 0; j < i; ++j) {
++                        ret.add(players.get(j));
++                    }
++                }
++            } else if (ret != null) {
++                ret.add(player);
++            }
++        }
++        return ret == null ? players : ret;
++    }
++
++    /**
++     * Sends players with masked sections in this chunk their own light packet without the block light of those
++     * sections, the client keeps the empty block light it got with the chunk.
++     *
++     * @return the players that can receive the shared packet, possibly a reused list valid until the next call
++     */
++    private List<ServerPlayer> leaf$broadcastFilteredLight(final org.dreeam.leaf.world.antifreecam.AntiFreecamManager antiFreecam, final List<ServerPlayer> players, final LevelChunk chunk) {
++        final int chunkX = chunk.getPos().x();
++        final int chunkZ = chunk.getPos().z();
++        // light sections start one section below the world
++        final int minLightSection = this.levelHeightAccessor.getMinSectionY() - 1;
++        it.unimi.dsi.fastutil.objects.ObjectArrayList<ServerPlayer> shared = null;
++        for (int i = 0, len = players.size(); i < len; ++i) {
++            final ServerPlayer player = players.get(i);
++            java.util.BitSet blockFilter = null;
++            long[][] partialMasks = null;
++            boolean partial = false;
++            for (int lightIndex = this.blockChangedLightSectionFilter.nextSetBit(0); lightIndex >= 0; lightIndex = this.blockChangedLightSectionFilter.nextSetBit(lightIndex + 1)) {
++                final int sectionY = minLightSection + lightIndex;
++                if (!antiFreecam.isSectionMasked(player, chunkX, sectionY, chunkZ) && antiFreecam.isSectionPartial(player, chunkX, sectionY, chunkZ)) {
++                    // real cells keep their block light, culled cells get none (same mask as the sent section)
++                    final int blockSection = sectionY - this.levelHeightAccessor.getMinSectionY();
++                    final long[] mask = org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.partialCulling((ServerLevel)chunk.getLevel()).mask(chunk, blockSection, ((ServerLevel)chunk.getLevel()).getServer().getTickCount());
++                    partial = true;
++                    if (mask != null) {
++                        if (partialMasks == null) {
++                            partialMasks = new long[this.levelHeightAccessor.getSectionsCount()][];
++                        }
++                        partialMasks[blockSection] = mask;
++                    }
++                    continue;
++                }
++                if (antiFreecam.isSectionMasked(player, chunkX, sectionY, chunkZ)) {
++                    if (blockFilter == null) {
++                        blockFilter = this.leaf$filteredLight;
++                        if (blockFilter == null) {
++                            this.leaf$filteredLight = blockFilter = new java.util.BitSet();
++                        }
++                        blockFilter.clear();
++                        blockFilter.or(this.blockChangedLightSectionFilter);
++                    }
++                    blockFilter.clear(lightIndex);
++                }
++            }
++            if (blockFilter == null && !partial) {
++                if (shared != null) {
++                    shared.add(player);
++                }
++                continue;
++            }
++            if (shared == null) {
++                shared = this.leaf$filteredPlayers();
++                for (int j = 0; j < i; ++j) {
++                    shared.add(players.get(j));
++                }
++            }
++            final java.util.BitSet effectiveBlockFilter = blockFilter == null ? this.blockChangedLightSectionFilter : blockFilter;
++            if (!effectiveBlockFilter.isEmpty() || !this.skyChangedLightSectionFilter.isEmpty()) {
++                // the packet copies the light data, the filter is only read in the constructor
++                player.connection.send(new ClientboundLightUpdatePacket(chunkX, chunkZ, new net.minecraft.network.protocol.game.ClientboundLightUpdatePacketData(
++                    chunk.getPos(), this.lightEngine, this.skyChangedLightSectionFilter, effectiveBlockFilter, null, partialMasks
++                )));
++            }
+         }
++        return shared == null ? players : shared;
+     }
++    // Leaf end - Anti-freecam
+ 
+     private void broadcastBlockEntityIfNeeded(final List<ServerPlayer> players, final Level level, final BlockPos pos, final BlockState state) {
+         if (state.hasBlockEntity()) {
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index 0a0dad530483297ef6313cad73b41e317aff5b3d..d547286dd5184644b0e7a77648ddf8eb85ee846a 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -1508,7 +1508,8 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+                 }
+                 visibleToPlayer = visibleToPlayer
+                     && this.entity.broadcastToPlayer(player)
+-                    && ChunkMap.this.isChunkTracked(player, this.entity.chunkPosition().x(), this.entity.chunkPosition().z());
++                    && ChunkMap.this.isChunkTracked(player, this.entity.chunkPosition().x(), this.entity.chunkPosition().z())
++                    && !org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.isEntityHidden(ChunkMap.this.level, player, this.entity); // Leaf - Anti-freecam
+                 // Paper end - Configurable entity tracking range by Y
+                 // CraftBukkit start - respect vanish API
+                 if (visibleToPlayer && !player.getBukkitEntity().canSeeChunkMapUpdatePlayer(this.entity.getBukkitEntity())) { // Paper - only consider hits // SparklyPaper - optimize canSee checks
+@@ -1601,7 +1602,8 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+                         && ((rangeYSqr == 0.0) || ((dy * dy) <= rangeYSqr))
+                         && this.entity.broadcastToPlayer(player)
+                         && ChunkMap.this.isChunkTracked(player, eChunkX, eChunkZ)
+-                        && player.getBukkitEntity().canSeeChunkMapUpdatePlayer(this.entity.getBukkitEntity());
++                        && player.getBukkitEntity().canSeeChunkMapUpdatePlayer(this.entity.getBukkitEntity())
++                        && !org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.isEntityHidden(ChunkMap.this.level, player, this.entity); // Leaf - Anti-freecam
+                     if (flag) {
+                         if (!this.seenBy.contains(player.connection)) {
+                             ctx.collectStartSeenByPlayer(player.connection, this);
+@@ -1656,7 +1658,8 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+                         visibleToPlayer = deltaToPlayerY * deltaToPlayerY <= rangeY * rangeY;
+                     }
+                 }
+-                visibleToPlayer = visibleToPlayer && this.entity.broadcastToPlayer(player) && ChunkMap.this.isChunkTracked(player, this.entity.chunkPosition().x(), this.entity.chunkPosition().z());
++                visibleToPlayer = visibleToPlayer && this.entity.broadcastToPlayer(player) && ChunkMap.this.isChunkTracked(player, this.entity.chunkPosition().x(), this.entity.chunkPosition().z())
++                    && !org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.isEntityHidden(ChunkMap.this.level, player, this.entity); // Leaf - Anti-freecam
+                 // Paper end - Configurable entity tracking range by Y
+                 // CraftBukkit start - respect vanish API
+                 if (visibleToPlayer && !player.getBukkitEntity().canSeeChunkMapUpdatePlayer(this.entity.getBukkitEntity())) { // Paper - only consider hits // SparklyPaper - optimize canSee checks
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 19feded98dfc1c27acf638a45225125e15eb8fde..54a4876d09bf4777e9ee55ae31429e6cd09a4140 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -246,6 +246,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     private final alternate.current.wire.WireHandler wireHandler = new alternate.current.wire.WireHandler(this); // Paper - optimize redstone (Alternate Current)
+     public boolean hasRidableMoveEvent = false; // Purpur - Ridables
+     public final org.dreeam.leaf.async.tracker.AsyncTracker leaf$asyncTracker = new org.dreeam.leaf.async.tracker.AsyncTracker(); // Leaf - Multithreaded tracker
++    // Leaf start - Anti-freecam - see AntiFreecamHooks#manager
++    public volatile org.dreeam.leaf.world.antifreecam.@Nullable AntiFreecamManager leaf$antiFreecam;
++    public int leaf$antiFreecamGeneration = -1;
++    public org.dreeam.leaf.world.antifreecam.@Nullable PartialCulling leaf$partialCulling; // tick thread only
++    // Leaf end - Anti-freecam
+     private @Nullable WorldBorder worldBorder; // Leaf - Cache world border
+ 
+     @Override
+@@ -2001,6 +2006,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         levelChunk.unregisterTickContainerFromLevel(this);
+         this.debugSynchronizers.dropChunk(levelChunk.getPos());
+         ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel)this).moonrise$getPlayerChunkLoader().leaf$farChunkManager.onChunkUnload(levelChunk.getPos().x(), levelChunk.getPos().z()); // Leaf - Extended view distance - its save is queued at this point
++        org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.onChunkUnload(this, levelChunk.getPos().x(), levelChunk.getPos().z()); // Leaf - Anti-freecam
+     }
+ 
+     public void removePlayerImmediately(final ServerPlayer player, final Entity.RemovalReason reason) {
+@@ -2057,6 +2063,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+                         continue;
+                     }
+                     // CraftBukkit end
++                    if (org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.isHidden(player, blockPos.getX(), blockPos.getY(), blockPos.getZ())) continue; // Leaf - Anti-freecam
+                     player.connection.send(packet); // Gale - SportPaper - reduce block destruction packet allocations
+                 }
+             }
+@@ -2084,7 +2091,8 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+                 z,
+                 sound.value().getRange(volume),
+                 this.dimension(),
+-                new ClientboundSoundPacket(sound, source, x, y, z, volume, pitch, seed)
++                new ClientboundSoundPacket(sound, source, x, y, z, volume, pitch, seed),
++                net.minecraft.server.players.PlayerList.ANTI_FREECAM_EFFECT // Leaf - Anti-freecam
+             );
+     }
+ 
+@@ -2107,7 +2115,9 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+                 sourceEntity.getZ(),
+                 sound.value().getRange(volume),
+                 this.dimension(),
+-                new ClientboundSoundEntityPacket(sound, source, sourceEntity, volume, pitch, seed)
++                new ClientboundSoundEntityPacket(sound, source, sourceEntity, volume, pitch, seed),
++                net.minecraft.server.players.PlayerList.ANTI_FREECAM_EFFECT, // Leaf - Anti-freecam
++                sourceEntity // Leaf - Anti-freecam - the packet references the entity, so it must not reach players it is hidden from
+             );
+     }
+ 
+@@ -2146,7 +2156,8 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+                 pos.getZ(),
+                 64.0, // Paper - diff on change (the 64.0 distance is used as defaults for sound ranges in spigot config for ender dragon, end portal and wither)
+                 this.dimension(),
+-                new ClientboundLevelEventPacket(type, pos, data, false)
++                new ClientboundLevelEventPacket(type, pos, data, false),
++                net.minecraft.server.players.PlayerList.ANTI_FREECAM_EFFECT // Leaf - Anti-freecam
+             );
+     }
+ 
+@@ -2338,6 +2349,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         for (ServerPlayer player : this.players) {
+             if (player.distanceToSqr(center) < 4096.0) {
+                 Optional<Vec3> playerKnockback = Optional.ofNullable(explosion.getHitPlayers().get(player));
++                if (playerKnockback.isEmpty() && org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.isHidden(player, x, y, z)) continue; // Leaf - Anti-freecam - keep the packet if it carries knockback
+                 player.connection
+                     .send(
+                         new ClientboundExplodePacket(
+@@ -2375,7 +2387,8 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+                             eventData.pos().getZ(),
+                             64.0,
+                             this.dimension(),
+-                            new ClientboundBlockEventPacket(eventData.pos(), eventData.block(), eventData.paramA(), eventData.paramB())
++                            new ClientboundBlockEventPacket(eventData.pos(), eventData.block(), eventData.paramA(), eventData.paramB()),
++                            net.minecraft.server.players.PlayerList.ANTI_FREECAM_ALWAYS // Leaf - Anti-freecam
+                         );
+                 }
+             } else {
+@@ -2739,6 +2752,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         for (int i = 0; i < receivers.size(); i++) { // Paper - particle API
+             ServerPlayer player = receivers.get(i); // Paper - particle API
+             if (sender != null && !player.getBukkitEntity().canSee(sender.getBukkitEntity())) continue; // CraftBukkit // Leaf - Remove stream in CraftWorld#spawnParticle - diff on change
++            if (org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.isEffectHidden(player, x, y, z)) continue; // Leaf - Anti-freecam - plugin particles sent through the Bukkit API are not filtered
+             if (this.sendParticles(player, overrideLimiter, x, y, z, packet)) {
+                 result++;
+             }
+diff --git a/net/minecraft/server/network/PlayerChunkSender.java b/net/minecraft/server/network/PlayerChunkSender.java
+index 196c01fe5f200ed57e6f23e0939cac616305571a..f2787a89b2a254631d9234eb1727cb32cc07e1b4 100644
+--- a/net/minecraft/server/network/PlayerChunkSender.java
++++ b/net/minecraft/server/network/PlayerChunkSender.java
+@@ -81,7 +81,8 @@ public class PlayerChunkSender {
+     public static void sendChunk(final ServerGamePacketListenerImpl connection, final ServerLevel level, final LevelChunk chunk) { // Paper - rewrite chunk system - public
+         // Paper start - Anti-Xray
+         final boolean shouldModify = level.chunkPacketBlockController.shouldModify(connection.player, chunk);
+-        connection.send(new ClientboundLevelChunkWithLightPacket(chunk, level.getLightEngine(), null, null, shouldModify));
++        final org.dreeam.leaf.world.antifreecam.SendMasks leaf$masks = org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.onChunkSend(connection.player, chunk); // Leaf - Anti-freecam
++        connection.send(new ClientboundLevelChunkWithLightPacket(chunk, level.getLightEngine(), null, null, shouldModify, org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.hidden(leaf$masks), org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.partial(leaf$masks))); // Leaf - Anti-freecam
+         // Paper end - Anti-Xray
+         // Paper start - PlayerChunkLoadEvent
+         if (io.papermc.paper.event.packet.PlayerChunkLoadEvent.getHandlerList().getRegisteredListeners().length > 0) {
+diff --git a/net/minecraft/server/players/PlayerList.java b/net/minecraft/server/players/PlayerList.java
+index e27685615e7d554bdf4e7c41149ccee211ed9bce..f1a20c5eb3b48445a124ae683d27d0ee0865915c 100644
+--- a/net/minecraft/server/players/PlayerList.java
++++ b/net/minecraft/server/players/PlayerList.java
+@@ -1058,6 +1058,47 @@ public abstract class PlayerList {
+         final ResourceKey<Level> dimension,
+         final Packet<?> packet
+     ) {
++        // Leaf start - Anti-freecam
++        this.broadcast(except, x, y, z, range, dimension, packet, ANTI_FREECAM_NONE);
++    }
++
++    public static final int ANTI_FREECAM_NONE = 0;
++    // sounds and particles, only filtered if enabled in the config
++    public static final int ANTI_FREECAM_EFFECT = 1;
++    // block events and other world state, always filtered
++    public static final int ANTI_FREECAM_ALWAYS = 2;
++
++    /**
++     * @param leaf$antiFreecamFilter whether anti-freecam drops the packet for players that cannot see its position
++     */
++    public void broadcast(
++        final @Nullable Player except,
++        final double x,
++        final double y,
++        final double z,
++        final double range,
++        final ResourceKey<Level> dimension,
++        final Packet<?> packet,
++        final int leaf$antiFreecamFilter
++    ) {
++        this.broadcast(except, x, y, z, range, dimension, packet, leaf$antiFreecamFilter, null);
++    }
++
++    /**
++     * @param leaf$antiFreecamEntity entity the packet is about, the packet is dropped for players anti-freecam hides it from
++     */
++    public void broadcast(
++        final @Nullable Player except,
++        final double x,
++        final double y,
++        final double z,
++        final double range,
++        final ResourceKey<Level> dimension,
++        final Packet<?> packet,
++        final int leaf$antiFreecamFilter,
++        final net.minecraft.world.entity.@Nullable Entity leaf$antiFreecamEntity
++    ) {
++        // Leaf end - Anti-freecam
+         for (int i = 0; i < this.players.size(); i++) {
+             ServerPlayer player = this.players.get(i);
+             // CraftBukkit start - Test if player receiving packet can see the source of the packet
+@@ -1070,6 +1111,15 @@ public abstract class PlayerList {
+                 double yd = y - player.getY();
+                 double zd = z - player.getZ();
+                 if (xd * xd + yd * yd + zd * zd < range * range) {
++                    // Leaf start - Anti-freecam
++                    if (leaf$antiFreecamFilter == ANTI_FREECAM_ALWAYS ? org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.isHidden(player, x, y, z)
++                        : leaf$antiFreecamFilter == ANTI_FREECAM_EFFECT && org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.isEffectHidden(player, x, y, z)) {
++                        continue;
++                    }
++                    if (leaf$antiFreecamEntity != null && org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.isEntityHidden(player.level(), player, leaf$antiFreecamEntity)) {
++                        continue;
++                    }
++                    // Leaf end - Anti-freecam
+                     player.connection.send(packet);
+                 }
+             }
+diff --git a/net/minecraft/world/level/chunk/LevelChunk.java b/net/minecraft/world/level/chunk/LevelChunk.java
+index 9851a60140f9989fbac317db200d8484d43ee16c..4eda730913077c36f09f0a5c133a43d8eb34d360 100644
+--- a/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -458,6 +458,7 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+             leaf$tickingBlocksDirty = true;
+         }
+         // Leaf end - optimize random tick
++        if (this.level instanceof net.minecraft.server.level.ServerLevel serverLevel) org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.onBlockChanged(serverLevel, pos.getX(), y, pos.getZ(), oldState, state); // Leaf - Anti-freecam
+ 
+         Block newBlock = state.getBlock();
+         // Leaf start - Lithium - combined heightmap update

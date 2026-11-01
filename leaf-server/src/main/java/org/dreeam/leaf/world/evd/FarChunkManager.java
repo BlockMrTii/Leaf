@@ -17,6 +17,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.chunk.LevelChunk;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.dreeam.leaf.config.modules.misc.AntiFreecam;
 import org.dreeam.leaf.config.modules.opt.ExtendedViewDistance;
 import org.jspecify.annotations.Nullable;
 
@@ -50,9 +51,9 @@ public final class FarChunkManager {
     private final Long2ObjectOpenHashMap<InFlight> inFlight = new Long2ObjectOpenHashMap<>();
     private final ConcurrentLinkedQueue<Completed> completed = new ConcurrentLinkedQueue<>();
 
-    private record CacheEntry(@Nullable Packet<?> packet, long createdNanos) {}
+    private record CacheEntry(@Nullable Packet<?> packet, long createdNanos, int generation, boolean antiFreecamEnabled) {}
 
-    private record Completed(long key, @Nullable Packet<?> packet, boolean cacheable) {}
+    private record Completed(long key, @Nullable Packet<?> packet, boolean cacheable, int generation, boolean antiFreecamEnabled) {}
 
     private static final class InFlight {
         private final ReferenceArrayList<FarChunkTracker> waiters = new ReferenceArrayList<>(2);
@@ -64,10 +65,12 @@ public final class FarChunkManager {
     }
 
     /**
-     * Anti-Xray only obfuscates packets of loaded chunks, so snapshots from disk would leak ores.
+     * Anti-Xray only obfuscates packets of loaded chunks, so snapshots from disk would leak ores
+     * unless Anti-Freecam is enabled to hide subterranean sections and obfuscate ores.
      */
     public static boolean isSupported(final ServerLevel world) {
-        return world.chunkPacketBlockController == ChunkPacketBlockController.NO_OPERATION_INSTANCE;
+        return world.chunkPacketBlockController == ChunkPacketBlockController.NO_OPERATION_INSTANCE
+            || AntiFreecam.isEnabled(world);
     }
 
     /**
@@ -83,14 +86,25 @@ public final class FarChunkManager {
         // loaded chunks are newer than their saved data, so build from the live chunk
         final LevelChunk live = ((ChunkSystemLevel)this.world).moonrise$getFullChunkIfLoaded(chunkX, chunkZ);
         if (live != null && ((ChunkSystemLevelChunk)live).moonrise$isPostProcessingDone()) {
-            tracker.deliver(key, new ClientboundLevelChunkWithLightPacket(live, this.world.getLightEngine(), null, null, true));
-            return DELIVERED;
+            final ClientboundLevelChunkWithLightPacket packet;
+            if (AntiFreecam.isEnabled(this.world)) {
+                packet = FarChunkPacketBuilder.buildLive(this.world, live);
+            } else {
+                packet = new ClientboundLevelChunkWithLightPacket(live, this.world.getLightEngine(), null, null, true);
+            }
+            if (packet != null) {
+                tracker.deliver(key, packet);
+                return DELIVERED;
+            }
         }
 
         if (ExtendedViewDistance.cacheSize > 0) {
             final CacheEntry entry = this.cache.getAndMoveToLast(key);
             if (entry != null) {
-                if (System.nanoTime() - entry.createdNanos() <= TimeUnit.SECONDS.toNanos(ExtendedViewDistance.cacheExpireSeconds)) {
+                final int currentGen = AntiFreecam.generation;
+                final boolean currentEnabled = AntiFreecam.isEnabled(this.world);
+                if (entry.generation() == currentGen && entry.antiFreecamEnabled() == currentEnabled
+                        && System.nanoTime() - entry.createdNanos() <= TimeUnit.SECONDS.toNanos(ExtendedViewDistance.cacheExpireSeconds)) {
                     tracker.deliver(key, entry.packet());
                     return DELIVERED;
                 }
@@ -123,20 +137,24 @@ public final class FarChunkManager {
         try {
             MoonriseRegionFileIO.loadDataAsync(world, chunkX, chunkZ, MoonriseRegionFileIO.RegionFileType.CHUNK_DATA,
                 (final CompoundTag tag, final Throwable throwable) -> {
+                    final int gen = AntiFreecam.generation;
+                    final boolean enabled = AntiFreecam.isEnabled(world);
                     if (throwable != null) {
                         LOGGER.debug("Failed to read chunk ({}, {}) for extended view distance", chunkX, chunkZ, throwable);
-                        completed.add(new Completed(key, null, false));
+                        completed.add(new Completed(key, null, false, gen, enabled));
                         return;
                     }
                     if (tag == null) {
                         // not generated yet
-                        completed.add(new Completed(key, null, true));
+                        completed.add(new Completed(key, null, true, gen, enabled));
                         return;
                     }
                     try {
                         executor().execute(() -> {
                             Packet<?> packet = null;
                             boolean cacheable = true;
+                            final int workerGen = AntiFreecam.generation;
+                            final boolean workerEnabled = AntiFreecam.isEnabled(world);
                             try {
                                 packet = FarChunkPacketBuilder.build(world, tag, chunkX, chunkZ);
                             } catch (final Throwable thr) {
@@ -144,15 +162,15 @@ public final class FarChunkManager {
                                 cacheable = false;
                                 LOGGER.debug("Failed to build chunk ({}, {}) for extended view distance", chunkX, chunkZ, thr);
                             }
-                            completed.add(new Completed(key, packet, cacheable));
+                            completed.add(new Completed(key, packet, cacheable, workerGen, workerEnabled));
                         });
                     } catch (final RejectedExecutionException ex) {
-                        completed.add(new Completed(key, null, false));
+                        completed.add(new Completed(key, null, false, gen, enabled));
                     }
                 }, false, Priority.LOW);
         } catch (final Throwable thr) {
             LOGGER.debug("Failed to schedule read of chunk ({}, {}) for extended view distance", chunkX, chunkZ, thr);
-            completed.add(new Completed(key, null, false));
+            completed.add(new Completed(key, null, false, AntiFreecam.generation, AntiFreecam.isEnabled(world)));
         }
     }
 
@@ -186,8 +204,19 @@ public final class FarChunkManager {
                 continue;
             }
 
+            final int currentGen = AntiFreecam.generation;
+            final boolean currentEnabled = AntiFreecam.isEnabled(this.world);
+            if (done.generation() != currentGen || done.antiFreecamEnabled() != currentEnabled) {
+                // Config changed while building: discard and re-request for waiting trackers
+                final InFlight retry = new InFlight();
+                retry.waiters.addAll(pending.waiters);
+                this.inFlight.put(key, retry);
+                this.submitRead(key);
+                continue;
+            }
+
             if (done.cacheable() && ExtendedViewDistance.cacheSize > 0) {
-                this.cache.putAndMoveToLast(key, new CacheEntry(done.packet(), System.nanoTime()));
+                this.cache.putAndMoveToLast(key, new CacheEntry(done.packet(), System.nanoTime(), done.generation(), done.antiFreecamEnabled()));
                 while (this.cache.size() > ExtendedViewDistance.cacheSize) {
                     this.cache.removeFirst();
                 }
