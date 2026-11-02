@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: BlockMrTii <134159440+BlockMrTii@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 09:49:34 +0100
+Subject: [PATCH] Extended view distance live snapshot invalidation
+
+
+diff --git a/net/minecraft/world/level/chunk/LevelChunk.java b/net/minecraft/world/level/chunk/LevelChunk.java
+index 4eda730913077c36f09f0a5c133a43d8eb34d360..2c7a027673fc41b98cf234cba9cec45dcddb4fde 100644
+--- a/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -276,6 +276,7 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+     public void markUnsaved() {
+         boolean wasUnsaved = this.isUnsaved();
+         super.markUnsaved();
++        if (this.level instanceof net.minecraft.server.level.ServerLevel serverLevel) org.dreeam.leaf.world.evd.FarChunkManager.onChunkChanged(serverLevel, this.chunkPos.x(), this.chunkPos.z()); // Leaf - Extended view distance - block entity and light changes
+         if (!wasUnsaved) {
+             this.unsavedListener.setUnsaved(this.chunkPos);
+         }
+@@ -458,7 +459,10 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+             leaf$tickingBlocksDirty = true;
+         }
+         // Leaf end - optimize random tick
+-        if (this.level instanceof net.minecraft.server.level.ServerLevel serverLevel) org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.onBlockChanged(serverLevel, pos.getX(), y, pos.getZ(), oldState, state); // Leaf - Anti-freecam
++        if (this.level instanceof net.minecraft.server.level.ServerLevel serverLevel) {
++            org.dreeam.leaf.world.antifreecam.AntiFreecamHooks.onBlockChanged(serverLevel, pos.getX(), y, pos.getZ(), oldState, state); // Leaf - Anti-freecam
++            org.dreeam.leaf.world.evd.FarChunkManager.onBlockChanged(serverLevel, pos.getX(), pos.getZ()); // Leaf - Extended view distance
++        }
+ 
+         Block newBlock = state.getBlock();
+         // Leaf start - Lithium - combined heightmap update

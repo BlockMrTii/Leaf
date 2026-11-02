@@ -1,5 +1,6 @@
 package org.dreeam.leaf.world.antifreecam;
 
+import io.netty.buffer.Unpooled;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
@@ -14,7 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class HiddenSectionWriter {
 
-    private static final ConcurrentHashMap<BlockState, PalettedContainer<BlockState>> CONTAINERS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<BlockState, byte[]> CACHED_BLOCK_BYTES = new ConcurrentHashMap<>();
 
     private HiddenSectionWriter() {}
 
@@ -32,17 +33,30 @@ public final class HiddenSectionWriter {
         return sectionY < 0 ? Blocks.DEEPSLATE.defaultBlockState() : Blocks.STONE.defaultBlockState();
     }
 
-    private static PalettedContainer<BlockState> getContainer(Level level, BlockState filler) {
-        PalettedContainer<BlockState> container = CONTAINERS.get(filler);
-        if (container == null) {
-            Strategy<BlockState> strategy = level != null
-                ? level.palettedContainerFactory().blockStatesStrategy()
-                : Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY);
-            container = new PalettedContainer<>(filler, strategy, null);
-            PalettedContainer<BlockState> existing = CONTAINERS.putIfAbsent(filler, container);
-            return existing != null ? existing : container;
+    private static byte[] getBlockBytes(Level level, BlockState filler) {
+        byte[] bytes = CACHED_BLOCK_BYTES.get(filler);
+        if (bytes == null) {
+            bytes = serializeContainer(level, filler);
+            byte[] existing = CACHED_BLOCK_BYTES.putIfAbsent(filler, bytes);
+            return existing != null ? existing : bytes;
         }
-        return container;
+        return bytes;
+    }
+
+    private static byte[] serializeContainer(Level level, BlockState filler) {
+        Strategy<BlockState> strategy = level != null
+            ? level.palettedContainerFactory().blockStatesStrategy()
+            : Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY);
+        PalettedContainer<BlockState> container = new PalettedContainer<>(filler, strategy, null);
+        FriendlyByteBuf tempBuf = new FriendlyByteBuf(Unpooled.buffer(container.getSerializedSize()));
+        try {
+            container.write(tempBuf, null, 0);
+            byte[] bytes = new byte[tempBuf.readableBytes()];
+            tempBuf.readBytes(bytes);
+            return bytes;
+        } finally {
+            tempBuf.release();
+        }
     }
 
     /**
@@ -50,8 +64,8 @@ public final class HiddenSectionWriter {
      */
     public static int serializedSize(Level level, LevelChunkSection realSection, int sectionY) {
         BlockState filler = filler(level, sectionY);
-        PalettedContainer<BlockState> container = getContainer(level, filler);
-        return 4 + container.getSerializedSize() + realSection.getBiomes().getSerializedSize();
+        byte[] blockBytes = getBlockBytes(level, filler);
+        return 4 + blockBytes.length + realSection.getBiomes().getSerializedSize();
     }
 
     /**
@@ -62,11 +76,11 @@ public final class HiddenSectionWriter {
      */
     public static void write(FriendlyByteBuf buffer, Level level, LevelChunkSection realSection, int sectionY) {
         BlockState filler = filler(level, sectionY);
-        PalettedContainer<BlockState> container = getContainer(level, filler);
+        byte[] blockBytes = getBlockBytes(level, filler);
 
         buffer.writeShort((short) 4096);
         buffer.writeShort((short) 0);
-        container.write(buffer, null, sectionY);
+        buffer.writeBytes(blockBytes);
         realSection.getBiomes().write(buffer, null, sectionY);
     }
 }

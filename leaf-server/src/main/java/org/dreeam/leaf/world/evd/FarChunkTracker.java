@@ -2,7 +2,6 @@ package org.dreeam.leaf.world.evd;
 
 import ca.spottedleaf.moonrise.common.util.CoordinateUtils;
 import ca.spottedleaf.moonrise.patches.chunk_system.util.ParallelSearchRadiusIteration;
-import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.network.protocol.Packet;
@@ -22,6 +21,9 @@ import org.jspecify.annotations.Nullable;
  * never loaded, ticked or tracked. A chunk leaving the regular send area but staying inside the ring is kept on the
  * client instead of being forgotten, and a ring chunk entering the send area is replaced once the loader sends it.
  * <p>
+ * Missing chunk candidates are iterated lazily via a cursor into the precomputed distance-ordered offset array
+ * instead of rebuilding an intermediate candidate queue on every loader update.
+ * <p>
  * All methods must be called on the tick thread of the player.
  */
 public final class FarChunkTracker {
@@ -35,9 +37,14 @@ public final class FarChunkTracker {
     private final LongOpenHashSet farSent = new LongOpenHashSet();
     // snapshots requested from the manager and not yet delivered
     private final LongOpenHashSet requested = new LongOpenHashSet();
-    // candidates ordered by distance, rebuilt on every loader update
-    private final LongArrayList queue = new LongArrayList();
-    private int queueIndex;
+    // snapshots requested and dropped (e.g. ungenerated or unreadable) during the current update
+    private final LongOpenHashSet droppedThisUpdate = new LongOpenHashSet();
+    // true while synchronously executing manager.request(), so deliver() knows if a miss was synchronous
+    private boolean inRequest;
+    // precomputed relative chunk offsets ordered by euclidean distance, updated on loader update
+    private long @Nullable [] iteration;
+    // scan cursor into iteration, advanced lazily in tick()
+    private int cursor;
 
     private int centerX = Integer.MIN_VALUE;
     private int centerZ = Integer.MIN_VALUE;
@@ -129,9 +136,6 @@ public final class FarChunkTracker {
      * Called by the loader after it recalculated its own state and before it sends the new chunk center.
      */
     public void finishUpdate() {
-        this.queue.clear();
-        this.queueIndex = 0;
-
         // forget snapshots that left the ring
         if (!this.farSent.isEmpty()) {
             for (final LongIterator iterator = this.farSent.iterator(); iterator.hasNext();) {
@@ -159,52 +163,54 @@ public final class FarChunkTracker {
             }
         }
 
-        if (this.farDistance <= 0) {
-            this.queue.trim();
-            return;
+        // keeps its capacity, so it stops allocating once warmed up; bounded by the ring size
+        if (!this.droppedThisUpdate.isEmpty()) {
+            this.droppedThisUpdate.clear();
         }
 
-        // ordered by distance, nearest first
-        final long[] toIterate = ParallelSearchRadiusIteration.getEuclideanIteration(this.farDistance);
-        for (final long deltaChunk : toIterate) {
-            final int chunkX = CoordinateUtils.getChunkX(deltaChunk) + this.centerX;
-            final int chunkZ = CoordinateUtils.getChunkZ(deltaChunk) + this.centerZ;
-            if (!this.isWithinFar(chunkX, chunkZ) || this.isRealWanted(chunkX, chunkZ)) {
-                continue;
-            }
-            final long key = CoordinateUtils.getChunkKey(chunkX, chunkZ);
-            if (this.farSent.contains(key) || this.requested.contains(key) || this.realSent.contains(key)) {
-                continue;
-            }
-            this.queue.add(key);
-        }
+        this.cursor = 0;
+        this.iteration = this.farDistance > 0 ? ParallelSearchRadiusIteration.getEuclideanIteration(this.farDistance) : null;
     }
 
     /**
      * Requests the next snapshots, limited by the per-player budget and the per-world read limit.
      */
     public void tick() {
-        if (this.removed || this.farDistance <= 0) {
+        if (this.removed || this.farDistance <= 0 || this.iteration == null) {
             return;
         }
 
+        final long[] iteration = this.iteration;
         int budget = ExtendedViewDistance.sendsPerTick;
         // cached misses (e.g. ungenerated chunks at the world edge) cost no budget, but bound the work per tick
         int misses = budget * 16;
-        while (budget > 0 && this.queueIndex < this.queue.size()) {
-            final long key = this.queue.getLong(this.queueIndex);
-            if (this.farSent.contains(key) || this.requested.contains(key) || this.realSent.contains(key)) {
-                ++this.queueIndex;
+        while (budget > 0 && this.cursor < iteration.length) {
+            final long deltaChunk = iteration[this.cursor];
+            final int chunkX = CoordinateUtils.getChunkX(deltaChunk) + this.centerX;
+            final int chunkZ = CoordinateUtils.getChunkZ(deltaChunk) + this.centerZ;
+            if (!this.isWithinFar(chunkX, chunkZ) || this.isRealWanted(chunkX, chunkZ)) {
+                ++this.cursor;
+                continue;
+            }
+            final long key = CoordinateUtils.getChunkKey(chunkX, chunkZ);
+            if (this.farSent.contains(key) || this.requested.contains(key) || this.realSent.contains(key) || this.droppedThisUpdate.contains(key)) {
+                ++this.cursor;
                 continue;
             }
 
             this.requested.add(key);
-            final int result = this.manager.request(this, key);
+            final int result;
+            this.inRequest = true;
+            try {
+                result = this.manager.request(this, key);
+            } finally {
+                this.inRequest = false;
+            }
             if (result == FarChunkManager.BUSY) {
                 this.requested.remove(key);
                 break;
             }
-            ++this.queueIndex;
+            ++this.cursor;
             if (result == FarChunkManager.DELIVERED && !this.farSent.contains(key)) {
                 if (--misses <= 0) {
                     break;
@@ -220,7 +226,13 @@ public final class FarChunkTracker {
      * fully generated, unreadable).
      */
     void deliver(final long key, final @Nullable Packet<?> packet) {
-        if (this.removed || !this.requested.remove(key) || packet == null) {
+        if (this.removed || !this.requested.remove(key)) {
+            return;
+        }
+        if (packet == null) {
+            if (!this.inRequest) {
+                this.droppedThisUpdate.add(key);
+            }
             return;
         }
         final int chunkX = CoordinateUtils.getChunkX(key);
@@ -249,7 +261,10 @@ public final class FarChunkTracker {
         }
         this.farSent.clear();
         this.requested.clear();
-        this.queue.clear();
+        this.droppedThisUpdate.clear();
+        this.iteration = null;
+        this.cursor = 0;
+        this.inRequest = false;
     }
 
     private void sendForget(final int chunkX, final int chunkZ) {

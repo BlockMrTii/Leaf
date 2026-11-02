@@ -19,6 +19,8 @@ public class ExtendedViewDistance extends ConfigModule {
     public static int cacheSize = 2048;
     public static int cacheExpireSeconds = 300;
     public static boolean sendBlockEntities = true;
+    public static int liveBuildsPerTick = 16;
+    public static int liveCacheTicks = 40;
 
     @Override
     public void onLoaded() {
@@ -47,5 +49,9 @@ public class ExtendedViewDistance extends ConfigModule {
         cacheSize = Math.max(0, globalConfig.getInt(basePath() + ".cache-size", cacheSize));
         cacheExpireSeconds = Math.max(1, globalConfig.getInt(basePath() + ".cache-expire-seconds", cacheExpireSeconds));
         sendBlockEntities = globalConfig.getBoolean(basePath() + ".send-block-entities", sendBlockEntities);
+        // snapshots built from loaded chunks on the main thread, per world and tick
+        liveBuildsPerTick = Math.max(1, globalConfig.getInt(basePath() + ".live-builds-per-tick", liveBuildsPerTick));
+        // how long such a snapshot is reused for other players, 0 disables the reuse
+        liveCacheTicks = Math.max(0, globalConfig.getInt(basePath() + ".live-cache-ticks", liveCacheTicks));
     }
 }

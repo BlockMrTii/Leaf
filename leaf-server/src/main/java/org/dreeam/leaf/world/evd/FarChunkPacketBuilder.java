@@ -8,6 +8,7 @@ import io.netty.buffer.Unpooled;
 import io.papermc.paper.antixray.ChunkPacketBlockController;
 import io.papermc.paper.configuration.type.EngineMode;
 import it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.EnumMap;
@@ -43,7 +44,93 @@ public final class FarChunkPacketBuilder {
 
     private static final int BLOCK_ENTITY_LIMIT = Integer.getInteger("Paper.excessiveTELimit", 750);
 
+    // Bounded, immutable snapshots; weak keys do not retain unloaded worlds or old configurations.
+    private static volatile Classification[] classifications = new Classification[0];
+    private static int nextClassification;
+
     private FarChunkPacketBuilder() {}
+
+    private static Classification classification(ServerLevel world) {
+        var antiXray = world.paperConfig().anticheat.antiXray;
+        for (Classification cached : classifications) {
+            if (cached.configuration.get() == antiXray) {
+                return cached;
+            }
+        }
+        synchronized (Classification.class) {
+            Classification[] current = classifications;
+            for (Classification cached : current) {
+                if (cached.configuration.get() == antiXray) {
+                    return cached;
+                }
+            }
+            Classification created = new Classification(antiXray, antiXray.hiddenBlocks, antiXray.replacementBlocks, antiXray.engineMode, antiXray.lavaObscures);
+            Classification[] updated;
+            if (current.length < 8) {
+                updated = java.util.Arrays.copyOf(current, current.length + 1);
+                updated[current.length] = created;
+            } else {
+                updated = current.clone();
+                updated[nextClassification] = created;
+                nextClassification = (nextClassification + 1) % updated.length;
+            }
+            classifications = updated;
+            return created;
+        }
+    }
+
+    private static final class Classification {
+        private final WeakReference<Object> configuration;
+        private final @Nullable Set<Block> hiddenBlocks;
+        private final @Nullable Set<Block> replacementBlocks;
+        private final boolean lavaObscures;
+        private final Predicate<BlockState> stone;
+        private final Predicate<BlockState> deepslate;
+        private final Predicate<BlockState> netherrack;
+        private final Predicate<BlockState> endStone;
+
+        private Classification(Object configuration, @Nullable List<Block> hiddenBlocks, @Nullable List<Block> replacementBlocks, EngineMode engineMode, boolean lavaObscures) {
+            this.configuration = new WeakReference<>(configuration);
+            this.hiddenBlocks = hiddenBlocks != null && !hiddenBlocks.isEmpty() ? new ReferenceOpenHashSet<>(hiddenBlocks) : null;
+            boolean obfuscate = engineMode == EngineMode.OBFUSCATE || engineMode == EngineMode.OBFUSCATE_LAYER;
+            this.replacementBlocks = obfuscate && replacementBlocks != null && !replacementBlocks.isEmpty() ? new ReferenceOpenHashSet<>(replacementBlocks) : null;
+            this.lavaObscures = lavaObscures;
+            this.stone = new PaletteCheck(this, Blocks.STONE.defaultBlockState());
+            this.deepslate = new PaletteCheck(this, Blocks.DEEPSLATE.defaultBlockState());
+            this.netherrack = new PaletteCheck(this, Blocks.NETHERRACK.defaultBlockState());
+            this.endStone = new PaletteCheck(this, Blocks.END_STONE.defaultBlockState());
+        }
+
+        private Predicate<BlockState> paletteCheck(BlockState filler) {
+            if (filler == Blocks.STONE.defaultBlockState()) {
+                return this.stone;
+            }
+            if (filler == Blocks.DEEPSLATE.defaultBlockState()) {
+                return this.deepslate;
+            }
+            return filler == Blocks.NETHERRACK.defaultBlockState() ? this.netherrack : this.endStone;
+        }
+    }
+
+    private static final class PaletteCheck implements Predicate<BlockState> {
+        private final Classification classification;
+        private final BlockState filler;
+
+        private PaletteCheck(Classification classification, BlockState filler) {
+            this.classification = classification;
+            this.filler = filler;
+        }
+
+        @Override
+        public boolean test(BlockState state) {
+            if (state == this.filler) {
+                return false;
+            }
+            Block block = state.getBlock();
+            return (this.classification.hiddenBlocks != null && this.classification.hiddenBlocks.contains(block))
+                || (this.classification.replacementBlocks != null && this.classification.replacementBlocks.contains(block));
+        }
+    }
 
     /**
      * Off-main-thread safe. Returns null if the chunk is unusable (not FULL, light not correct,
@@ -107,10 +194,8 @@ public final class FarChunkPacketBuilder {
             List<CompoundTag> rawBlockEntities = data.blockEntities();
             if (ExtendedViewDistance.sendBlockEntities && rawBlockEntities != null && !rawBlockEntities.isEmpty()) {
                 blockEntitiesData = new ArrayList<>();
-                List<Block> hiddenBlocks = world.paperConfig().anticheat.antiXray.hiddenBlocks;
-                Set<Block> hiddenBlocksSet = (antiFreecamEnabled && world.chunkPacketBlockController != ChunkPacketBlockController.NO_OPERATION_INSTANCE && hiddenBlocks != null && !hiddenBlocks.isEmpty())
-                    ? new ReferenceOpenHashSet<>(hiddenBlocks)
-                    : null;
+                Set<Block> hiddenBlocksSet = antiFreecamEnabled && world.chunkPacketBlockController != ChunkPacketBlockController.NO_OPERATION_INSTANCE
+                    ? classification(world).hiddenBlocks : null;
                 for (CompoundTag tag : rawBlockEntities) {
                     if (blockEntitiesData.size() >= BLOCK_ENTITY_LIMIT) {
                         break;
@@ -157,7 +242,7 @@ public final class FarChunkPacketBuilder {
             if (antiFreecamEnabled) {
                 // Disk path has no loaded neighbor chunk data available asynchronously;
                 // chunk boundaries are treated as exposed (matching Paper's EMPTY_SECTION = transparent behavior).
-                obfuscateNonHiddenSections(world, sections, sectionCount, hiddenSections, null, null, null, null);
+                obfuscateNonHiddenSections(world, sections, sectionCount, hiddenSections, false, null, null, null, null);
             }
 
             byte[] buffer = serializeSections(world, sections, sectionCount, hiddenSections);
@@ -272,6 +357,7 @@ public final class FarChunkPacketBuilder {
         try {
             int sectionCount = world.getSectionsCount();
             int minSectionY = world.getMinSectionY();
+            BitSet hiddenSections = EvdSurface.hiddenSections(live);
             LevelChunkSection[] rawSections = live.getSections();
             LevelChunkSection[] sections = new LevelChunkSection[sectionCount];
 
@@ -280,11 +366,10 @@ public final class FarChunkPacketBuilder {
                 if (raw == null) {
                     sections[i] = new LevelChunkSection(world.palettedContainerFactory(), world, live.getPos(), world.getSectionYFromSectionIndex(i));
                 } else {
-                    sections[i] = raw.copy();
+                    // Borrow read-only until obfuscation needs to change this section.
+                    sections[i] = raw;
                 }
             }
-
-            BitSet hiddenSections = EvdSurface.hiddenSections(live);
 
             int chunkX = live.getPos().x();
             int chunkZ = live.getPos().z();
@@ -299,7 +384,7 @@ public final class FarChunkPacketBuilder {
             LevelChunkSection[] northSections = northChunk != null ? northChunk.getSections() : null;
             LevelChunkSection[] southSections = southChunk != null ? southChunk.getSections() : null;
 
-            obfuscateNonHiddenSections(world, sections, sectionCount, hiddenSections, westSections, eastSections, northSections, southSections);
+            obfuscateNonHiddenSections(world, sections, sectionCount, hiddenSections, true, westSections, eastSections, northSections, southSections);
 
             byte[] buffer = serializeSections(world, sections, sectionCount, hiddenSections);
             if (buffer == null) {
@@ -318,10 +403,8 @@ public final class FarChunkPacketBuilder {
             List<ClientboundLevelChunkPacketData.BlockEntityInfo> blockEntitiesData;
             if (ExtendedViewDistance.sendBlockEntities && !live.getBlockEntities().isEmpty()) {
                 blockEntitiesData = new ArrayList<>();
-                List<Block> hiddenBlocks = world.paperConfig().anticheat.antiXray.hiddenBlocks;
-                Set<Block> hiddenBlocksSet = (world.chunkPacketBlockController != ChunkPacketBlockController.NO_OPERATION_INSTANCE && hiddenBlocks != null && !hiddenBlocks.isEmpty())
-                    ? new ReferenceOpenHashSet<>(hiddenBlocks)
-                    : null;
+                Set<Block> hiddenBlocksSet = world.chunkPacketBlockController != ChunkPacketBlockController.NO_OPERATION_INSTANCE
+                    ? classification(world).hiddenBlocks : null;
 
                 for (BlockEntity be : live.getBlockEntities().values()) {
                     if (blockEntitiesData.size() >= BLOCK_ENTITY_LIMIT) {
@@ -407,6 +490,7 @@ public final class FarChunkPacketBuilder {
         LevelChunkSection[] sections,
         int sectionCount,
         @Nullable BitSet hiddenSections,
+        boolean copyOnWrite,
         @Nullable LevelChunkSection[] westSections,
         @Nullable LevelChunkSection[] eastSections,
         @Nullable LevelChunkSection[] northSections,
@@ -416,57 +500,45 @@ public final class FarChunkPacketBuilder {
             return;
         }
 
-        var antiXray = world.paperConfig().anticheat.antiXray;
-        List<Block> hiddenBlocks = antiXray.hiddenBlocks;
-        Set<Block> hiddenBlocksSet = (hiddenBlocks != null && !hiddenBlocks.isEmpty())
-            ? new ReferenceOpenHashSet<>(hiddenBlocks)
-            : null;
-
-        boolean isObfuscateMode = antiXray.engineMode == EngineMode.OBFUSCATE || antiXray.engineMode == EngineMode.OBFUSCATE_LAYER;
-        List<Block> replacementBlocks = isObfuscateMode ? antiXray.replacementBlocks : null;
-        Set<Block> replacementBlocksSet = (replacementBlocks != null && !replacementBlocks.isEmpty())
-            ? new ReferenceOpenHashSet<>(replacementBlocks)
-            : null;
-
+        Classification classification = classification(world);
+        Set<Block> hiddenBlocksSet = classification.hiddenBlocks;
+        Set<Block> replacementBlocksSet = classification.replacementBlocks;
         if (hiddenBlocksSet == null && replacementBlocksSet == null) {
             return;
         }
-
-        boolean lavaObscures = antiXray.lavaObscures;
-
-        Predicate<BlockState> paletteCheck;
-        if (hiddenBlocksSet != null && replacementBlocksSet != null) {
-            paletteCheck = state -> {
-                Block b = state.getBlock();
-                return hiddenBlocksSet.contains(b) || replacementBlocksSet.contains(b);
-            };
-        } else if (hiddenBlocksSet != null) {
-            paletteCheck = state -> hiddenBlocksSet.contains(state.getBlock());
-        } else {
-            paletteCheck = state -> replacementBlocksSet.contains(state.getBlock());
-        }
+        boolean lavaObscures = classification.lavaObscures;
 
         for (int i = 0; i < sectionCount; i++) {
             if (hiddenSections != null && hiddenSections.get(i)) {
                 continue;
             }
             LevelChunkSection section = sections[i];
-            if (section == null || !section.maybeHas(paletteCheck)) {
+            BlockState filler = HiddenSectionWriter.filler(world, world.getSectionYFromSectionIndex(i));
+            if (section == null || !section.maybeHas(classification.paletteCheck(filler))) {
                 continue;
             }
 
-            BlockState filler = HiddenSectionWriter.filler(world, world.getSectionYFromSectionIndex(i));
+            boolean needsCopy = copyOnWrite;
             for (int y = 0; y < 16; y++) {
                 for (int z = 0; z < 16; z++) {
                     for (int x = 0; x < 16; x++) {
                         BlockState state = section.getBlockState(x, y, z);
+                        if (state == filler) {
+                            continue;
+                        }
                         Block block = state.getBlock();
-                        if (hiddenBlocksSet != null && hiddenBlocksSet.contains(block)) {
-                            section.setBlockState(x, y, z, filler, false);
-                        } else if (replacementBlocksSet != null && replacementBlocksSet.contains(block)) {
-                            if (isEnclosed(sections, i, sectionCount, x, y, z, lavaObscures, westSections, eastSections, northSections, southSections)) {
-                                section.setBlockState(x, y, z, filler, false);
+                        boolean replace = hiddenBlocksSet != null && hiddenBlocksSet.contains(block);
+                        if (!replace && replacementBlocksSet != null && replacementBlocksSet.contains(block)) {
+                            replace = isEnclosed(sections, i, sectionCount, x, y, z, lavaObscures, westSections, eastSections, northSections, southSections);
+                        }
+                        if (replace) {
+                            if (needsCopy) {
+                                // Publish the copy before mutation so subsequent enclosure checks see it.
+                                section = section.copy();
+                                sections[i] = section;
+                                needsCopy = false;
                             }
+                            section.setBlockState(x, y, z, filler, false);
                         }
                     }
                 }

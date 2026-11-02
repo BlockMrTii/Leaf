@@ -50,6 +50,15 @@ public final class FarChunkManager {
     private final Long2ObjectLinkedOpenHashMap<CacheEntry> cache = new Long2ObjectLinkedOpenHashMap<>();
     private final Long2ObjectOpenHashMap<InFlight> inFlight = new Long2ObjectOpenHashMap<>();
     private final ConcurrentLinkedQueue<Completed> completed = new ConcurrentLinkedQueue<>();
+    // snapshots of loaded chunks, shared between players for a short time; insertion ordered, oldest first
+    private final Long2ObjectLinkedOpenHashMap<LiveEntry> liveCache = new Long2ObjectLinkedOpenHashMap<>();
+    private long currentTick;
+    private int liveBuildsThisTick;
+
+    private static final int LIVE_CACHE_MAX_SIZE = 1024;
+    private static final int EXPIRE_CHECKS_PER_TICK = 16;
+
+    private record LiveEntry(Packet<?> packet, long createdTick, int generation, boolean antiFreecamEnabled) {}
 
     private record CacheEntry(@Nullable Packet<?> packet, long createdNanos, int generation, boolean antiFreecamEnabled) {}
 
@@ -86,13 +95,40 @@ public final class FarChunkManager {
         // loaded chunks are newer than their saved data, so build from the live chunk
         final LevelChunk live = ((ChunkSystemLevel)this.world).moonrise$getFullChunkIfLoaded(chunkX, chunkZ);
         if (live != null && ((ChunkSystemLevelChunk)live).moonrise$isPostProcessingDone()) {
+            final boolean antiFreecamEnabled = AntiFreecam.isEnabled(this.world);
+            final int generation = AntiFreecam.generation;
+            // a snapshot is never updated once sent, so one built a moment ago for another player is equivalent
+            if (ExtendedViewDistance.liveCacheTicks > 0) {
+                final LiveEntry entry = this.liveCache.get(key);
+                if (entry != null) {
+                    if (entry.generation() == generation && entry.antiFreecamEnabled() == antiFreecamEnabled
+                            && this.currentTick - entry.createdTick() <= ExtendedViewDistance.liveCacheTicks) {
+                        tracker.deliver(key, entry.packet());
+                        return DELIVERED;
+                    }
+                    this.liveCache.remove(key);
+                }
+            }
+
+            // building happens on the tick thread, bound the work per tick
+            if (this.liveBuildsThisTick >= ExtendedViewDistance.liveBuildsPerTick) {
+                return BUSY;
+            }
+            ++this.liveBuildsThisTick;
+
             final ClientboundLevelChunkWithLightPacket packet;
-            if (AntiFreecam.isEnabled(this.world)) {
+            if (antiFreecamEnabled) {
                 packet = FarChunkPacketBuilder.buildLive(this.world, live);
             } else {
                 packet = new ClientboundLevelChunkWithLightPacket(live, this.world.getLightEngine(), null, null, true);
             }
             if (packet != null) {
+                if (ExtendedViewDistance.liveCacheTicks > 0) {
+                    this.liveCache.putAndMoveToLast(key, new LiveEntry(packet, this.currentTick, generation, antiFreecamEnabled));
+                    while (this.liveCache.size() > LIVE_CACHE_MAX_SIZE) {
+                        this.liveCache.removeFirst();
+                    }
+                }
                 tracker.deliver(key, packet);
                 return DELIVERED;
             }
@@ -114,7 +150,10 @@ public final class FarChunkManager {
 
         InFlight pending = this.inFlight.get(key);
         if (pending != null) {
-            pending.waiters.add(tracker);
+            // a tracker can re-request a key after dropping it, it must be delivered once
+            if (!pending.waiters.contains(tracker)) {
+                pending.waiters.add(tracker);
+            }
             return PENDING;
         }
 
@@ -179,13 +218,21 @@ public final class FarChunkManager {
      */
     public void tick() {
         TickThread.ensureTickThread("Cannot tick far chunk manager async");
+        ++this.currentTick;
+        this.liveBuildsThisTick = 0;
         if (!ExtendedViewDistance.enabled && this.inFlight.isEmpty()) {
             if (!this.cache.isEmpty()) {
                 this.cache.clear();
                 this.cache.trim();
             }
+            if (!this.liveCache.isEmpty()) {
+                this.liveCache.clear();
+                this.liveCache.trim();
+            }
             return;
         }
+
+        this.expireEntries();
 
         Completed done;
         while ((done = this.completed.poll()) != null) {
@@ -230,12 +277,83 @@ public final class FarChunkManager {
     }
 
     /**
+     * Drops expired entries so packets nobody requests again are not retained until the cache is full.
+     */
+    private void expireEntries() {
+        // insertion ordered, the oldest entries come first
+        if (!this.liveCache.isEmpty()) {
+            final int maxAge = ExtendedViewDistance.liveCacheTicks;
+            while (!this.liveCache.isEmpty() && this.currentTick - this.liveCache.get(this.liveCache.firstLongKey()).createdTick() > maxAge) {
+                this.liveCache.removeFirst();
+            }
+        }
+
+        // access ordered, so creation times are only roughly ascending: check a few of the least recently used
+        if (!this.cache.isEmpty()) {
+            final long now = System.nanoTime();
+            final long maxAge = TimeUnit.SECONDS.toNanos(ExtendedViewDistance.cacheExpireSeconds);
+            for (int i = 0; i < EXPIRE_CHECKS_PER_TICK && !this.cache.isEmpty(); ++i) {
+                if (now - this.cache.get(this.cache.firstLongKey()).createdNanos() <= maxAge) {
+                    break;
+                }
+                this.cache.removeFirst();
+            }
+        }
+    }
+
+    /**
+     * Called when a block of a loaded chunk changes, so that players requesting the chunk afterwards never get a
+     * snapshot built before the change. Chunk edges also invalidate the neighbor, its ore obfuscation reads them.
+     */
+    public static void onBlockChanged(final ServerLevel world, final int blockX, final int blockZ) {
+        if (!TickThread.isTickThread()) {
+            return;
+        }
+        final FarChunkManager manager = ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel)world).moonrise$getPlayerChunkLoader().leaf$farChunkManager;
+        if (manager.liveCache.isEmpty()) {
+            return;
+        }
+        final int chunkX = blockX >> 4;
+        final int chunkZ = blockZ >> 4;
+        manager.liveCache.remove(CoordinateUtils.getChunkKey(chunkX, chunkZ));
+        final int localX = blockX & 15;
+        final int localZ = blockZ & 15;
+        if (localX == 0) {
+            manager.liveCache.remove(CoordinateUtils.getChunkKey(chunkX - 1, chunkZ));
+        } else if (localX == 15) {
+            manager.liveCache.remove(CoordinateUtils.getChunkKey(chunkX + 1, chunkZ));
+        }
+        if (localZ == 0) {
+            manager.liveCache.remove(CoordinateUtils.getChunkKey(chunkX, chunkZ - 1));
+        } else if (localZ == 15) {
+            manager.liveCache.remove(CoordinateUtils.getChunkKey(chunkX, chunkZ + 1));
+        }
+    }
+
+    /**
+     * Called when a loaded chunk is marked unsaved: block entity data and light changes on the tick thread.
+     * Light computed off the tick thread is not seen here, a snapshot may miss it for at most the cache time.
+     */
+    public static void onChunkChanged(final ServerLevel world, final int chunkX, final int chunkZ) {
+        if (!TickThread.isTickThread()) {
+            return;
+        }
+        final FarChunkManager manager = ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel)world).moonrise$getPlayerChunkLoader().leaf$farChunkManager;
+        if (!manager.liveCache.isEmpty()) {
+            manager.liveCache.remove(CoordinateUtils.getChunkKey(chunkX, chunkZ));
+        }
+    }
+
+    /**
      * Called when a full chunk unloads. Its save is queued at this point, so later reads see the new data.
      */
     public void onChunkUnload(final int chunkX, final int chunkZ) {
         final long key = CoordinateUtils.getChunkKey(chunkX, chunkZ);
         if (!this.cache.isEmpty()) {
             this.cache.remove(key);
+        }
+        if (!this.liveCache.isEmpty()) {
+            this.liveCache.remove(key);
         }
         if (!this.inFlight.isEmpty()) {
             final InFlight pending = this.inFlight.get(key);
