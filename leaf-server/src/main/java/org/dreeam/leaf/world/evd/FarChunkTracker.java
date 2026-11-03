@@ -53,6 +53,10 @@ public final class FarChunkTracker {
     private int farDistance = 0;
     private boolean removed;
 
+    public boolean isRemoved() {
+        return this.removed;
+    }
+
     public FarChunkTracker(final ServerPlayer player, final FarChunkManager manager, final LongOpenHashSet realSent) {
         this.player = player;
         this.manager = manager;

@@ -1,6 +1,7 @@
 package org.dreeam.leaf.util.list;
 
 import org.jspecify.annotations.NullMarked;
+import org.jspecify.annotations.Nullable;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -42,7 +43,10 @@ public final class WorldList {
         return this.names.isEmpty() && this.patterns.length == 0;
     }
 
-    public boolean contains(String worldName) {
+    public boolean contains(@Nullable String worldName) {
+        if (worldName == null) {
+            return false;
+        }
         if (this.names.contains(worldName)) {
             return true;
         }

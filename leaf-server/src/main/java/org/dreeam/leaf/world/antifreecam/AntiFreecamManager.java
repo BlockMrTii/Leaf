@@ -60,11 +60,11 @@ public final class AntiFreecamManager {
     private boolean changesOverflow;
 
     public AntiFreecamManager(final ServerLevel level) {
-        TickThread.ensureTickThread("Cannot create anti-freecam manager async");
+        TickThread.ensureTickThread(level, "Cannot create anti-freecam manager off-world-tick-thread");
         this.level = level;
         this.connectivity = new ConnectivityCache(level);
     }
-    private static void checkThread() { TickThread.ensureTickThread("Cannot access anti-freecam state async"); }
+    private void checkThread() { TickThread.ensureTickThread(this.level, "Cannot access anti-freecam state off-world-tick-thread"); }
     private PlayerVisibility state(final ServerPlayer player) {
         PlayerVisibility state = this.players.get(player);
         if (state == null) {
@@ -733,7 +733,8 @@ public final class AntiFreecamManager {
             if (chunk == null) return true;
             final int section = (y >> 4) - (this.level.getMinY() >> 4);
             if (section < 0 || section >= this.level.getSectionsCount()) return true;
-            if (steps != 0 && SectionConnectivity.isBarrier(chunk.getSections()[section].getBlockState(x & 15, y & 15, z & 15))) return false;
+            final net.minecraft.world.level.chunk.LevelChunkSection sec = chunk.getSections()[section];
+            if (steps != 0 && sec != null && SectionConnectivity.isBarrier(sec.getBlockState(x & 15, y & 15, z & 15))) return false;
             if (tx <= ty && tx <= tz) { x += stepX; tx += deltaX; }
             else if (ty <= tz) { y += stepY; ty += deltaY; }
             else { z += stepZ; tz += deltaZ; }

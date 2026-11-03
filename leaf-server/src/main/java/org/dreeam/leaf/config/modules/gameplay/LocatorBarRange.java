@@ -9,7 +9,7 @@ public class LocatorBarRange extends ConfigModule {
         return ConfigCategory.GAMEPLAY.basePath();
     }
 
-    public static double maxDistance = 0.0D;
+    public static volatile double maxDistance = 0.0D;
 
     @Override
     public void onLoaded() {

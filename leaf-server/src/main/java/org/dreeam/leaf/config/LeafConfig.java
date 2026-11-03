@@ -58,7 +58,7 @@ public class LeafConfig {
     private static final String SPARK_EXTRA_CONFIG_PROPERTY =  "spark.serverconfigs.extra";
     private static final String SPARK_HIDDEN_PATHS_PROPERTY =  "spark.serverconfigs.hiddenpaths";
 
-    private static LeafGlobalConfig globalConfig;
+    private static volatile LeafGlobalConfig globalConfig;
 
     //private static int preMajorVer;
     private static int preMinorVer;

@@ -244,6 +244,10 @@ public final class FarChunkManager {
 
             if (pending.stale) {
                 // the chunk was unloaded (and its save queued) while we were reading, read the new data
+                pending.waiters.removeIf(FarChunkTracker::isRemoved);
+                if (pending.waiters.isEmpty()) {
+                    continue;
+                }
                 final InFlight retry = new InFlight();
                 retry.waiters.addAll(pending.waiters);
                 this.inFlight.put(key, retry);
@@ -255,6 +259,10 @@ public final class FarChunkManager {
             final boolean currentEnabled = AntiFreecam.isEnabled(this.world);
             if (done.generation() != currentGen || done.antiFreecamEnabled() != currentEnabled) {
                 // Config changed while building: discard and re-request for waiting trackers
+                pending.waiters.removeIf(FarChunkTracker::isRemoved);
+                if (pending.waiters.isEmpty()) {
+                    continue;
+                }
                 final InFlight retry = new InFlight();
                 retry.waiters.addAll(pending.waiters);
                 this.inFlight.put(key, retry);
@@ -271,7 +279,10 @@ public final class FarChunkManager {
 
             final ReferenceArrayList<FarChunkTracker> waiters = pending.waiters;
             for (int i = 0, len = waiters.size(); i < len; ++i) {
-                waiters.get(i).deliver(key, done.packet());
+                final FarChunkTracker tracker = waiters.get(i);
+                if (!tracker.isRemoved()) {
+                    tracker.deliver(key, done.packet());
+                }
             }
         }
     }
