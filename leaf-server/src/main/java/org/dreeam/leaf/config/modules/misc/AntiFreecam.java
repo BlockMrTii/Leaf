@@ -18,10 +18,10 @@ public class AntiFreecam extends ConfigModule {
     public static int alwaysVisibleRadius = 1;
     public static int maxResendsPerPlayerTick = 4;
     public static int maxResendsPerTick = 64;
-    public static int rehideDelayTicks = 100;
+    public static int rehideDelayTicks = 20;
     public static int entityCheckIntervalTicks = 2;
-    public static double entityAlwaysVisibleDistance = 8.0;
-    public static double entityLineOfSightDistance = 64.0;
+    public static double entityAlwaysVisibleDistance = 4.0;
+    public static double entityLineOfSightDistance = 128.0;
     public static int entityLingerTicks = 20;
 
     // incremented on every (re)load so cached per-world state can detect config changes

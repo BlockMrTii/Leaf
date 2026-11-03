@@ -12,11 +12,13 @@ public final class ConnectivityCache {
     static final class Column {
         LevelChunk chunk;
         final short[] masks;
+        final SectionConnectivity.Components[] components;
         int minimumSurface = Integer.MIN_VALUE;
         int invalidationFloor = Integer.MIN_VALUE;
         Column(final LevelChunk chunk, final int height) {
             this.chunk = chunk;
             this.masks = new short[height];
+            this.components = new SectionConnectivity.Components[height];
             Arrays.fill(this.masks, (short)-1);
         }
     }
@@ -49,6 +51,11 @@ public final class ConnectivityCache {
         if (column.masks[section] == -1) column.masks[section] = SectionConnectivity.compute(column.chunk.getSections()[section]);
         return column.masks[section];
     }
+    public SectionConnectivity.Components components(final Column column, final int section) {
+        SectionConnectivity.Components components = column.components[section];
+        if (components == null) column.components[section] = components = SectionConnectivity.components(column.chunk.getSections()[section]);
+        return components;
+    }
     int minimumSurface(final Column column) {
         if (column.minimumSurface != Integer.MIN_VALUE) return column.minimumSurface;
         int minimum = Integer.MAX_VALUE;
@@ -68,7 +75,10 @@ public final class ConnectivityCache {
     }
     void invalidate(final int x, final int section, final int z) {
         final Column column = this.chunks.get(key(x, z));
-        if (column != null && section >= 0 && section < column.masks.length) column.masks[section] = -1;
+        if (column != null && section >= 0 && section < column.masks.length) {
+            column.masks[section] = -1;
+            column.components[section] = null;
+        }
     }
     void unload(final int x, final int z) {
         final Column column = this.chunks.remove(key(x, z));

@@ -25,6 +25,10 @@ public final class AntiFreecamManager {
     private static final int CONTINUATION_SEND_BUDGET = 32768;
     private static final int LOS_BUDGET_PER_PLAYER = 128;
     private static final int LOS_BUDGET_PER_WORLD = 1024;
+    // Entity line of sight zones: up to NEAR every check, up to FAR every MID_LOS_STRIDE-th, beyond every FAR_LOS_STRIDE-th
+    // check with two rays instead of nine. With the default interval of 2 ticks that is 2, 4 and 10 ticks.
+    private static final double NEAR_LOS_DISTANCE = 32.0, FAR_LOS_DISTANCE = 64.0;
+    private static final int MID_LOS_STRIDE = 2, FAR_LOS_STRIDE = 5;
     // Allocated once; the lookup invokes this only on the owning tick thread.
     private final Predicate<Entity> candidateSelector = this::selectCandidate;
     private int querySkip, querySeen;
@@ -34,6 +38,16 @@ public final class AntiFreecamManager {
     private final Reference2ObjectOpenHashMap<ServerPlayer, PlayerVisibility> players = new Reference2ObjectOpenHashMap<>();
     private volatile Int2ObjectOpenHashMap<VisibilitySnapshot> snapshots = new Int2ObjectOpenHashMap<>();
     private final ObjectArrayList<Entity> candidates = new ObjectArrayList<>();
+    // bumped whenever the cell masks a player holds change; the entity snapshot only rebuilds its mask index then
+    private final it.unimi.dsi.fastutil.objects.Reference2IntOpenHashMap<ServerPlayer> maskVersions = new it.unimi.dsi.fastutil.objects.Reference2IntOpenHashMap<>();
+    private final Reference2ObjectOpenHashMap<ServerPlayer, PublishedMasks> publishedMasks = new Reference2ObjectOpenHashMap<>();
+    private record PublishedMasks(int version, it.unimi.dsi.fastutil.longs.@Nullable Long2ObjectOpenHashMap<long[]> masks) {}
+    // last line of sight check tick per entity id, only for the zones that are checked less often
+    private final Reference2ObjectOpenHashMap<ServerPlayer, it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap> losChecks = new Reference2ObjectOpenHashMap<>();
+    // players whose sent cell masks changed since their snapshot was built
+    private final it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<PlayerVisibility> masksDirty = new it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<>();
+    // true between this manager's tick and the publication after the player chunk loader sent its chunks
+    private boolean batching;
     private long tick;
     private int generation = AntiFreecam.generation;
     private int rotation;
@@ -78,6 +92,8 @@ public final class AntiFreecamManager {
     }
     public void tick() {
         checkThread();
+        // chunk sends until publishChangedMasks are collected and published together after the loader tick
+        this.batching = true;
         this.connectivity.beginPass();
         ++this.tick;
         if (this.generation != AntiFreecam.generation) {
@@ -156,6 +172,11 @@ public final class AntiFreecamManager {
             }
         }
         this.rotation = (this.rotation + 1) % count;
+        // the resends above changed masks after this tick's snapshots were built
+        for (final PlayerVisibility state : this.masksDirty) {
+            if (this.players.get(state.player) == state && !state.bypass && AntiFreecam.entityCulling) this.updateEntities(state, 0);
+        }
+        this.masksDirty.clear();
         int snapshotCount = 0;
         boolean publicationChanged = false;
         final Int2ObjectOpenHashMap<VisibilitySnapshot> previous = this.snapshots;
@@ -198,10 +219,15 @@ public final class AntiFreecamManager {
         sent.awaitingResult = !state.bypass && !state.contains(x, this.level.getMinY() >> 4, z)
             && state.workContains(x, this.level.getMinY() >> 4, z);
         BitSet hidden = null, partial = null;
+        long[][] masks = null, componentMasks = null;
+        final int sectionCount = this.level.getSectionsCount(), minSection = this.level.getMinY() >> 4;
         if (!state.bypass) {
-            for (int section = 0; section < this.level.getSectionsCount(); ++section) {
-                final int target = state.maskStateForSend(x, (this.level.getMinY() >> 4) + section, z, surfaceSection);
-                final int actual = sent.maskState(section);
+            if (sent.culledSince == null) { sent.culledSince = new long[sectionCount]; Arrays.fill(sent.culledSince, -1L); }
+            final PartialCulling culling = AntiFreecamHooks.partialCulling(this.level);
+            final long lightTick = this.level.getServer().getTickCount();
+            for (int section = 0; section < sectionCount; ++section) {
+                final int target = state.maskStateForSend(x, minSection + section, z, surfaceSection);
+                final int actual = actualState(sent, section);
                 int outgoing = target;
                 if (target <= actual || firstSend) sent.hiddenSince[section] = -1L;
                 else {
@@ -211,31 +237,148 @@ public final class AntiFreecamManager {
                     else sent.hiddenSince[section] = -1L;
                 }
                 if (outgoing == PlayerVisibility.HIDDEN) {
-                    if (hidden == null) hidden = new BitSet(this.level.getSectionsCount());
+                    sent.culledSince[section] = -1L;
+                    if (hidden == null) hidden = new BitSet(sectionCount);
                     hidden.set(section);
                 } else if (outgoing == PlayerVisibility.PARTIAL) {
-                    if (partial == null) partial = new BitSet(this.level.getSectionsCount());
+                    sent.culledSince[section] = -1L;
+                    if (partial == null) partial = new BitSet(sectionCount);
                     partial.set(section);
+                    final long[] mask = culling.mask(chunk, section, lightTick);
+                    if (mask != null) {
+                        if (masks == null) masks = new long[sectionCount][];
+                        masks[section] = mask;
+                    }
+                } else {
+                    final long[] held = sent.componentMasks == null ? null : sent.componentMasks[section];
+                    // a real section that waits for its re-hide keeps the components the client already has
+                    long[] component = target == PlayerVisibility.REAL ? this.componentMask(state, sendColumn, x, minSection + section, z, section, true) : held;
+                    // reachability from before a topology change cannot be mapped onto the rebuilt components
+                    if (component == STALE_MASK) component = held;
+                    if (component != null && !firstSend && !covers(held, component)) {
+                        if (sent.culledSince[section] < 0) sent.culledSince[section] = this.tick;
+                        if (this.tick - sent.culledSince[section] < AntiFreecam.rehideDelayTicks) {
+                            // reveals apply at once, newly unreached components only after the delay
+                            component = intersect(held, component);
+                        } else sent.culledSince[section] = -1L;
+                    } else sent.culledSince[section] = -1L;
+                    if (component != null) {
+                        if (partial == null) partial = new BitSet(sectionCount);
+                        partial.set(section);
+                        if (componentMasks == null) componentMasks = new long[sectionCount][];
+                        componentMasks[section] = component;
+                        // at the surface only dark cells become filler, unreached sky-lit air must not turn into floating stone
+                        final long[] mask = minSection + section >= surfaceSection ? intersect(component, culling.mask(chunk, section, lightTick)) : component;
+                        if (mask != null) {
+                            if (masks == null) masks = new long[sectionCount][];
+                            masks[section] = mask;
+                        }
+                    }
                 }
             }
         } else Arrays.fill(sent.hiddenSince, -1L);
-        // The packet builder owns these BitSets; retain independent copies of the client state.
+        // The packet builder owns these BitSets; retain independent copies of the client state. Masks are never mutated.
         sent.hidden = hidden == null ? null : (BitSet)hidden.clone();
         sent.partial = partial == null ? null : (BitSet)partial.clone();
+        sent.masks = masks;
+        sent.componentMasks = componentMasks;
         state.reveals.remove(key); state.rehides.remove(key);
         state.nextDiffTick = 0;
-        return hidden == null && partial == null ? null : new SendMasks(hidden, partial);
+        this.masksChanged(state);
+        // a send outside of the chunk loader tick (e.g. a plugin refresh) must not leave the tracker on the old masks
+        if (!this.batching) this.publishChangedMasks();
+        return hidden == null && masks == null ? null : new SendMasks(hidden, masks);
+    }
+    // marks component reachability that refers to components rebuilt after the flood; never sent
+    private static final long[] STALE_MASK = new long[0];
+    /** Client-side state of a section; component culling of a real section stays REAL for the reveal/re-hide logic. */
+    private static int actualState(final PlayerVisibility.SentChunk sent, final int section) {
+        if (sent.componentMasks != null && sent.componentMasks[section] != null) return PlayerVisibility.REAL;
+        return sent.maskState(section);
+    }
+    /** Cells of the components the player does not reach, null if the section is sent whole, or STALE_MASK. */
+    private long @Nullable [] componentMask(final PlayerVisibility state, final ConnectivityCache.@Nullable Column column, final int cx, final int cy, final int cz, final int section, final boolean forSend) {
+        if (column == null) return null;
+        final SectionConnectivity.Components components = this.connectivity.components(column, section);
+        final int reached = forSend ? state.reachedBitsForSend(cx, cy, cz, components) : state.reachedBits(cx, cy, cz, components);
+        if (reached == -1) return null;
+        if (reached == PlayerVisibility.STALE) return STALE_MASK;
+        return components.culledCells(reached);
+    }
+    /** @return true if every cell of {@code inner} is also set in {@code outer} */
+    private static boolean covers(final long @Nullable [] outer, final long @Nullable [] inner) {
+        if (inner == null || outer == inner) return true;
+        if (outer == null) return false;
+        for (int i = 0; i < inner.length; ++i) if ((inner[i] & ~outer[i]) != 0L) return false;
+        return true;
+    }
+    private static boolean sameMask(final long @Nullable [] a, final long @Nullable [] b) {
+        return a == b || a != null && b != null && Arrays.equals(a, b);
+    }
+    /** Cells set in both, or null if none; returns an argument itself where possible and never mutates them. */
+    private static long @Nullable [] intersect(final long @Nullable [] a, final long @Nullable [] b) {
+        if (a == null || b == null) return null;
+        if (a == b || covers(b, a)) return a;
+        if (covers(a, b)) return b;
+        final long[] ret = new long[a.length];
+        long any = 0L;
+        for (int i = 0; i < ret.length; ++i) any |= ret[i] = a[i] & b[i];
+        return any == 0L ? null : ret;
+    }
+    /** The client terrain of the player changed, the entity snapshot rebuilds its cell masks. */
+    private void masksChanged(final PlayerVisibility state) {
+        this.maskVersions.addTo(state.player, 1);
+        state.snapshotNeedsRefresh = true;
+        this.masksDirty.add(state);
+    }
+    /**
+     * Rebuilds the snapshots of players whose sent masks changed after their snapshot was built (resends of this tick,
+     * chunk sends of the player chunk loader) without new line of sight rays, and publishes them. Tick thread only.
+     */
+    public void publishChangedMasks() {
+        checkThread();
+        if (this.masksDirty.isEmpty()) { this.batching = false; return; }
+        boolean changed = false;
+        for (final PlayerVisibility state : this.masksDirty) {
+            // the cell masks do not depend on a completed flood, e.g. right after a join or teleport
+            if (this.players.get(state.player) != state || state.bypass || !AntiFreecam.entityCulling) continue;
+            this.updateEntities(state, 0);
+            changed = true;
+        }
+        this.masksDirty.clear();
+        this.batching = false;
+        if (!changed) return;
+        final Int2ObjectOpenHashMap<VisibilitySnapshot> published = new Int2ObjectOpenHashMap<>(this.order.length);
+        for (final PlayerVisibility state : this.players.values()) if (state.snapshot != null) published.put(state.player.getId(), state.snapshot);
+        this.snapshots = published;
+    }
+    /** @return the cells of the section the client holds as filler, or null */
+    public long @Nullable [] sentMask(final ServerPlayer player, final int chunkX, final int sectionY, final int chunkZ) {
+        checkThread();
+        final PlayerVisibility state = this.players.get(player);
+        final int index = sectionY - (this.level.getMinY() >> 4);
+        if (state == null || state.bypass || player.isSpectator() || index < 0 || index >= this.level.getSectionsCount()) return null;
+        final PlayerVisibility.SentChunk sent = state.live.get(ConnectivityCache.key(chunkX, chunkZ));
+        return sent == null || sent.masks == null || sent.partial == null || !sent.partial.get(index) ? null : sent.masks[index];
+    }
+    /** @return true if the client of the player holds the block as filler of a partially culled section */
+    public boolean isCellCulled(final ServerPlayer player, final int blockX, final int blockY, final int blockZ) {
+        return AntiFreecamHooks.isCulled(this.sentMask(player, blockX >> 4, blockY >> 4, blockZ >> 4), blockX, blockY, blockZ);
     }
     public void onChunkForget(final ServerPlayer player, final int chunkX, final int chunkZ) {
         checkThread();
         final PlayerVisibility state = this.players.get(player);
         if (state == null) return;
         final long key = ConnectivityCache.key(chunkX, chunkZ);
-        state.live.remove(key); state.reveals.remove(key); state.rehides.remove(key);
+        if (state.live.remove(key) != null) this.masksChanged(state);
+        state.reveals.remove(key); state.rehides.remove(key);
     }
     public void onPlayerRemoved(final ServerPlayer player) {
         checkThread();
         if (this.players.remove(player) == null) return;
+        this.maskVersions.removeInt(player);
+        this.publishedMasks.remove(player);
+        this.losChecks.remove(player);
         this.orderDirty = true;
         // Do not retain the removed player in either the published view or the scheduling array.
         this.order = this.players.values().toArray(new PlayerVisibility[0]);
@@ -247,7 +390,7 @@ public final class AntiFreecamManager {
         checkThread();
         final int cx = x >> 4, cy = y >> 4, cz = z >> 4;
         final boolean surface = this.connectivity.invalidateSurface(cx, y, cz);
-        final boolean connectivity = oldState.isSolidRender() != newState.isSolidRender();
+        final boolean connectivity = SectionConnectivity.isBarrier(oldState) != SectionConnectivity.isBarrier(newState);
         if (!surface && !connectivity) return;
         if (connectivity) this.connectivity.invalidate(cx, cy - (this.level.getMinY() >> 4), cz);
         if (this.changedCount == this.changedX.length) this.changesOverflow = true;
@@ -264,7 +407,8 @@ public final class AntiFreecamManager {
         this.connectivity.unload(chunkX, chunkZ);
         final long key = ConnectivityCache.key(chunkX, chunkZ);
         for (final PlayerVisibility state : this.players.values()) {
-            state.live.remove(key); state.reveals.remove(key); state.rehides.remove(key);
+            if (state.live.remove(key) != null) this.masksChanged(state);
+            state.reveals.remove(key); state.rehides.remove(key);
             if (state.contains(chunkX, state.minY, chunkZ) || state.workContains(chunkX, state.workMinY, chunkZ)) state.dirty = true;
             state.forgetFrontier(key);
         }
@@ -306,7 +450,8 @@ public final class AntiFreecamManager {
         final long key = ConnectivityCache.key(chunkX, chunkZ);
         PlayerVisibility.SentChunk sent = state.live.get(key);
         if (sent == null) state.live.put(key, new PlayerVisibility.SentChunk(this.level.getSectionsCount()));
-        else { sent.hidden = null; sent.partial = null; sent.awaitingResult = false; Arrays.fill(sent.hiddenSince, -1L); }
+        else { sent.hidden = null; sent.partial = null; sent.masks = null; sent.componentMasks = null; sent.culledSince = null; sent.awaitingResult = false; Arrays.fill(sent.hiddenSince, -1L); }
+        this.masksChanged(state);
         state.reveals.remove(key);
         state.rehides.remove(key);
         state.nextDiffTick = 0;
@@ -326,6 +471,10 @@ public final class AntiFreecamManager {
             }
         }
         this.players.clear();
+        this.maskVersions.clear();
+        this.publishedMasks.clear();
+        this.losChecks.clear();
+        this.masksDirty.clear();
         this.order = new PlayerVisibility[0];
         this.orderDirty = false;
         this.snapshots = new Int2ObjectOpenHashMap<>();
@@ -352,8 +501,10 @@ public final class AntiFreecamManager {
             final ConnectivityCache.Column pendingColumn = sent.awaitingResult ? this.connectivity.resolve(x, z) : null;
             final int pendingSurface = pendingColumn == null ? Integer.MAX_VALUE : this.connectivity.minimumSurface(pendingColumn) >> 4;
             boolean reveal = false, rehide = false;
+            ConnectivityCache.Column componentColumn = pendingColumn;
+            boolean componentColumnResolved = pendingColumn != null;
             for (int section = 0; section < sent.hiddenSince.length; ++section) {
-                final int actual = sent.maskState(section);
+                final int actual = actualState(sent, section);
                 // An unfinished flood is not a reveal. The current surface/near-player exceptions
                 // and already proven paths still update pending chunks under the resend budgets.
                 final int desired = sent.awaitingResult
@@ -362,6 +513,28 @@ public final class AntiFreecamManager {
                 // Leaving the completed cube proves neither reachability nor occlusion. Freeze the
                 // actual client state (and cancel queued transitions) until a known result covers it.
                 final int target = desired == PlayerVisibility.UNKNOWN ? actual : desired;
+                if (target == PlayerVisibility.REAL && actual == PlayerVisibility.REAL && !state.bypass
+                    && (desired != PlayerVisibility.UNKNOWN) && (!sent.awaitingResult || pendingColumn != null)) {
+                    // Real sections can still differ in the components that are sent as filler.
+                    final long[] held = sent.componentMasks == null ? null : sent.componentMasks[section];
+                    if (!componentColumnResolved) { componentColumn = this.connectivity.resolve(x, z); componentColumnResolved = true; }
+                    long[] wanted = this.componentMask(state, componentColumn, x, minSection + section, z, section, sent.awaitingResult);
+                    // stale bits wait for the flood that the topology change started
+                    if (wanted == STALE_MASK) wanted = held;
+                    if (sameMask(held, wanted)) {
+                        if (sent.culledSince != null) sent.culledSince[section] = -1L;
+                    } else if (!covers(wanted, held)) {
+                        // the client holds filler where a component is reached now
+                        reveal = true;
+                        if (sent.culledSince != null) sent.culledSince[section] = -1L;
+                    } else {
+                        if (sent.culledSince == null) { sent.culledSince = new long[sent.hiddenSince.length]; Arrays.fill(sent.culledSince, -1L); }
+                        if (sent.culledSince[section] < 0) sent.culledSince[section] = this.tick;
+                        final long deadline = sent.culledSince[section] + AntiFreecam.rehideDelayTicks;
+                        if (this.tick >= deadline) rehide = true;
+                        else state.nextDiffTick = Math.min(state.nextDiffTick, deadline);
+                    }
+                }
                 if (target <= actual) {
                     sent.hiddenSince[section] = -1L;
                     if (target < actual) reveal = true;
@@ -444,6 +617,12 @@ public final class AntiFreecamManager {
                 || Math.abs(entity.getX() - player.getX()) > trackingRadius
                 || Math.abs(entity.getZ() - player.getZ()) > trackingRadius) partialIterator.remove();
         }
+        it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap checked = this.losChecks.get(player);
+        if (checked != null && this.tick % 200L == 0L) {
+            // forget entities that were not checked for a while (left the range or were removed)
+            final var checkedIterator = checked.int2LongEntrySet().fastIterator();
+            while (checkedIterator.hasNext()) if (this.tick - checkedIterator.next().getLongValue() > 200L) checkedIterator.remove();
+        }
         for (int n = 0; n < count; ++n) {
             final Entity entity = this.candidates.get(n);
             if (entity == player || exempt.contains(entity.getId())) continue;
@@ -455,25 +634,61 @@ public final class AntiFreecamManager {
                 state.partialOccluded.remove(id);
                 continue;
             }
-            // Also cover a still-sent partial section while its reveal waits in the resend queue.
-            final boolean partial = state.maskState(cx, cy, cz) == PlayerVisibility.PARTIAL || this.isSectionPartial(player, cx, cy, cz);
-            if (partial && AntiFreecamHooks.partialCulling(this.level).isCulled(
-                (int)Math.floor(entity.getX()), (int)Math.floor(entity.getY()), (int)Math.floor(entity.getZ()))) {
+            // The cells the client holds as filler are authoritative; a section that is about to become partial
+            // is covered by its sky light mask while its packet waits in the resend queue.
+            final int blockX = (int)Math.floor(entity.getX()), blockY = (int)Math.floor(entity.getY()), blockZ = (int)Math.floor(entity.getZ());
+            if (this.isCellCulled(player, blockX, blockY, blockZ)
+                || state.maskState(cx, cy, cz) == PlayerVisibility.PARTIAL && AntiFreecamHooks.partialCulling(this.level).isCulled(blockX, blockY, blockZ)) {
                 state.partialOccluded.add(id);
                 continue; // Cell filler is authoritative: no LOS rays, distance limit or linger.
             }
             state.partialOccluded.remove(id);
             if (distance > radius * radius || !state.contains(cx, cy, cz)) continue;
-            if (this.lineOfSight(player, entity)) {
+            // Farther entities are checked less often; their last result (occluded or seen) is kept in between.
+            final int stride = distance > FAR_LOS_DISTANCE * FAR_LOS_DISTANCE ? FAR_LOS_STRIDE : distance > NEAR_LOS_DISTANCE * NEAR_LOS_DISTANCE ? MID_LOS_STRIDE : 1;
+            if (stride > 1) {
+                if (checked == null) checked = this.losChecks.computeIfAbsent(player, k -> new it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap());
+                final long last = checked.getOrDefault(id, Long.MIN_VALUE);
+                if (last != Long.MIN_VALUE && this.tick - last < (long)stride * AntiFreecam.entityCheckIntervalTicks) continue;
+                checked.put(id, this.tick);
+            }
+            if (this.lineOfSight(player, entity, stride < FAR_LOS_STRIDE)) {
                 state.lastSeen.put(entity.getId(), this.tick);
                 state.occluded.remove(entity.getId());
             } else if (!state.lastSeen.containsKey(entity.getId())) state.occluded.add(entity.getId());
         }
         final IntOpenHashSet blocked = new IntOpenHashSet(state.occluded);
         blocked.addAll(state.partialOccluded);
-        state.snapshot = new VisibilitySnapshot(state, blocked, exempt, AntiFreecam.entityAlwaysVisibleDistance);
+        state.snapshot = new VisibilitySnapshot(state, blocked, exempt, AntiFreecam.entityAlwaysVisibleDistance, this.publishedMasks(state));
         state.snapshotNeedsRefresh = false;
         this.candidates.clear();
+    }
+    /**
+     * Immutable index of the culled cells the client of the player holds, by section key, for the tracker threads.
+     * Rebuilt only when a sent mask changed.
+     */
+    private it.unimi.dsi.fastutil.longs.@Nullable Long2ObjectOpenHashMap<long[]> publishedMasks(final PlayerVisibility state) {
+        final int version = this.maskVersions.getInt(state.player);
+        final PublishedMasks published = this.publishedMasks.get(state.player);
+        if (published != null && published.version() == version) return published.masks();
+        it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<long[]> masks = null;
+        final int minSection = this.level.getMinY() >> 4;
+        final var iterator = state.live.long2ObjectEntrySet().fastIterator();
+        while (iterator.hasNext()) {
+            final var entry = iterator.next();
+            final PlayerVisibility.SentChunk sent = entry.getValue();
+            if (sent.masks == null || sent.partial == null) continue;
+            final long key = entry.getLongKey();
+            final int chunkX = (int)key, chunkZ = (int)(key >> 32);
+            for (int section = sent.partial.nextSetBit(0); section >= 0 && section < sent.masks.length; section = sent.partial.nextSetBit(section + 1)) {
+                final long[] mask = sent.masks[section];
+                if (mask == null) continue;
+                if (masks == null) masks = new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();
+                masks.put(net.minecraft.core.SectionPos.asLong(chunkX, minSection + section, chunkZ), mask);
+            }
+        }
+        this.publishedMasks.put(state.player, new PublishedMasks(version, masks));
+        return masks;
     }
     private static void addPassengers(final Entity parent, final IntOpenHashSet exempt) {
         final var passengers = parent.getPassengers();
@@ -482,9 +697,11 @@ public final class AntiFreecamManager {
             if (exempt.add(passenger.getId())) addPassengers(passenger, exempt);
         }
     }
-    private boolean lineOfSight(final ServerPlayer player, final Entity entity) {
+    /** @param corners false for far entities: they cover a few pixels, the center and top center are enough */
+    private boolean lineOfSight(final ServerPlayer player, final Entity entity, final boolean corners) {
         final AABB box = entity.getBoundingBox();
         if (this.ray(player.getX(), player.getEyeY(), player.getZ(), (box.minX + box.maxX) * 0.5, (box.minY + box.maxY) * 0.5, (box.minZ + box.maxZ) * 0.5)) return true;
+        if (!corners) return this.ray(player.getX(), player.getEyeY(), player.getZ(), (box.minX + box.maxX) * 0.5, box.maxY, (box.minZ + box.maxZ) * 0.5);
         for (int corner = 0; corner < 8; ++corner) {
             if (this.ray(player.getX(), player.getEyeY(), player.getZ(), (corner & 1) == 0 ? box.minX : box.maxX,
                 (corner & 2) == 0 ? box.minY : box.maxY, (corner & 4) == 0 ? box.minZ : box.maxZ)) return true;
@@ -516,7 +733,7 @@ public final class AntiFreecamManager {
             if (chunk == null) return true;
             final int section = (y >> 4) - (this.level.getMinY() >> 4);
             if (section < 0 || section >= this.level.getSectionsCount()) return true;
-            if (chunk.getSections()[section].getBlockState(x & 15, y & 15, z & 15).isSolidRender()) return false;
+            if (steps != 0 && SectionConnectivity.isBarrier(chunk.getSections()[section].getBlockState(x & 15, y & 15, z & 15))) return false;
             if (tx <= ty && tx <= tz) { x += stepX; tx += deltaX; }
             else if (ty <= tz) { y += stepY; ty += deltaY; }
             else { z += stepZ; tz += deltaZ; }

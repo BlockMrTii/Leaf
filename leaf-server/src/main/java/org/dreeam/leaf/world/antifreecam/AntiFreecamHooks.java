@@ -73,6 +73,16 @@ public final class AntiFreecamHooks {
     }
 
     /**
+     * Called on the tick thread after the player chunk loader sent this tick's chunks.
+     */
+    public static void publishChangedMasks(final ServerLevel level) {
+        final AntiFreecamManager manager = level.leaf$antiFreecam;
+        if (manager != null) {
+            manager.publishChangedMasks();
+        }
+    }
+
+    /**
      * Players holding a partially culled section whose culled cells changed get the chunk again, once per chunk.
      */
     private static void resendChangedPartials(final ServerLevel level, final AntiFreecamManager manager, final PartialCulling partial) {
@@ -136,8 +146,19 @@ public final class AntiFreecamHooks {
         return masks == null ? null : masks.hidden();
     }
 
-    public static @Nullable BitSet partial(final @Nullable SendMasks masks) {
+    public static long @Nullable [][] partial(final @Nullable SendMasks masks) {
         return masks == null ? null : masks.partial();
+    }
+
+    /**
+     * @return {@code true} if the mask (index {@code y << 8 | z << 4 | x}) culls the block
+     */
+    public static boolean isCulled(final long @Nullable [] mask, final int x, final int y, final int z) {
+        if (mask == null) {
+            return false;
+        }
+        final int index = (y & 15) << 8 | (z & 15) << 4 | (x & 15);
+        return (mask[index >>> 6] & 1L << index) != 0;
     }
 
     /**
@@ -156,32 +177,7 @@ public final class AntiFreecamHooks {
      */
     public static boolean isCulledForPlayer(final ServerPlayer player, final int x, final int y, final int z) {
         final AntiFreecamManager manager = player.level().leaf$antiFreecam;
-        return manager != null && manager.isSectionPartial(player, x >> 4, y >> 4, z >> 4) && partialCulling(player.level()).isCulled(x, y, z);
-    }
-
-    /**
-     * Culled cell masks per block section index for the partial sections of a chunk packet, entries are {@code null}
-     * where nothing is culled. Uses the same entries as the section serialization of the same tick.
-     */
-    public static long @Nullable [][] partialMasks(final LevelChunk chunk, final @Nullable BitSet partialSections) {
-        if (partialSections == null || partialSections.isEmpty()) {
-            return null;
-        }
-        final ServerLevel level = (ServerLevel)chunk.getLevel();
-        final PartialCulling culling = partialCulling(level);
-        final long tick = level.getServer().getTickCount();
-        final int sectionCount = chunk.getSectionsCount();
-        long[][] ret = null;
-        for (int i = partialSections.nextSetBit(0); i >= 0 && i < sectionCount; i = partialSections.nextSetBit(i + 1)) {
-            final long[] mask = culling.mask(chunk, i, tick);
-            if (mask != null) {
-                if (ret == null) {
-                    ret = new long[sectionCount][];
-                }
-                ret[i] = mask;
-            }
-        }
-        return ret;
+        return manager != null && manager.isCellCulled(player, x, y, z);
     }
 
     public static void onChunkForget(final ServerLevel level, final ServerPlayer player, final int chunkX, final int chunkZ) {
@@ -232,8 +228,7 @@ public final class AntiFreecamHooks {
         final int blockX = net.minecraft.util.Mth.floor(x);
         final int blockY = net.minecraft.util.Mth.floor(y);
         final int blockZ = net.minecraft.util.Mth.floor(z);
-        return manager.isHidden(player, blockX, blockY, blockZ)
-            || (manager.isSectionPartial(player, blockX >> 4, blockY >> 4, blockZ >> 4) && partialCulling(player.level()).isCulled(blockX, blockY, blockZ));
+        return manager.isHidden(player, blockX, blockY, blockZ) || manager.isCellCulled(player, blockX, blockY, blockZ);
     }
 
     /**

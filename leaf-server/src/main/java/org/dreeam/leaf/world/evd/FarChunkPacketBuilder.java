@@ -17,6 +17,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
 import net.minecraft.core.SectionPos;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.FriendlyByteBuf;
@@ -24,6 +25,9 @@ import net.minecraft.network.protocol.game.ClientboundLevelChunkPacketData;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.network.protocol.game.ClientboundLightUpdatePacketData;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -34,10 +38,14 @@ import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.chunk.storage.SerializableChunkData;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.lighting.LayerLightEventListener;
+import net.minecraft.world.level.lighting.LevelLightEngine;
 import org.dreeam.leaf.config.modules.misc.AntiFreecam;
 import org.dreeam.leaf.config.modules.opt.ExtendedViewDistance;
+import org.dreeam.leaf.world.antifreecam.BiomeMasking;
 import org.dreeam.leaf.world.antifreecam.EvdSurface;
 import org.dreeam.leaf.world.antifreecam.HiddenSectionWriter;
+import org.dreeam.leaf.world.antifreecam.PartialCulling;
 import org.jspecify.annotations.Nullable;
 
 public final class FarChunkPacketBuilder {
@@ -185,7 +193,8 @@ public final class FarChunkPacketBuilder {
 
             boolean antiFreecamEnabled = AntiFreecam.isEnabled(world);
             Map<Heightmap.Types, long[]> rawHeightmaps = data.heightmaps();
-            BitSet hiddenSections = antiFreecamEnabled ? EvdSurface.hiddenSections(world, rawHeightmaps) : null;
+            EvdSurface.Result surfaceResult = antiFreecamEnabled ? EvdSurface.compute(world, rawHeightmaps) : null;
+            BitSet hiddenSections = surfaceResult != null ? surfaceResult.hiddenSections() : null;
 
             // 5. Block Entities (only if configured, up to BLOCK_ENTITY_LIMIT)
             // Extracted before obfuscateNonHiddenSections so loadStatic receives the original block state (e.g. chest)
@@ -210,6 +219,9 @@ public final class FarChunkPacketBuilder {
                             continue;
                         }
                         if (hiddenSections != null && hiddenSections.get(sectionIndex)) {
+                            continue;
+                        }
+                        if (surfaceResult != null && surfaceResult.isCellFilled(pos.getX(), pos.getY(), pos.getZ())) {
                             continue;
                         }
                         LevelChunkSection section = sections[sectionIndex];
@@ -240,9 +252,12 @@ public final class FarChunkPacketBuilder {
             }
 
             if (antiFreecamEnabled) {
+                if (surfaceResult != null && surfaceResult.partialSections() != null) {
+                    fillPartialSections(world, sections, sectionCount, surfaceResult, false, null);
+                }
                 // Disk path has no loaded neighbor chunk data available asynchronously;
                 // chunk boundaries are treated as exposed (matching Paper's EMPTY_SECTION = transparent behavior).
-                obfuscateNonHiddenSections(world, sections, sectionCount, hiddenSections, false, null, null, null, null);
+                obfuscateNonHiddenSections(world, sections, sectionCount, hiddenSections, false, null, null, null, null, null);
             }
 
             byte[] buffer = serializeSections(world, sections, sectionCount, hiddenSections);
@@ -297,6 +312,7 @@ public final class FarChunkPacketBuilder {
                 // Block Light
                 int blockSectionIndex = sd.y() - minSectionY;
                 boolean isHidden = hiddenSections != null && blockSectionIndex >= 0 && blockSectionIndex < sectionCount && hiddenSections.get(blockSectionIndex);
+                boolean isPartial = surfaceResult != null && surfaceResult.partialSections() != null && blockSectionIndex >= 0 && blockSectionIndex < sectionCount && surfaceResult.partialSections().get(blockSectionIndex);
 
                 if (isHidden) {
                     emptyBlockYMask.set(sectionIndex);
@@ -310,7 +326,11 @@ public final class FarChunkPacketBuilder {
                             return null; // Corrupted light data
                         }
                         blockYMask.set(sectionIndex);
-                        blockUpdates.add(blockLight.getData().clone());
+                        if (isPartial && surfaceResult.partialMasks() != null && surfaceResult.partialMasks()[blockSectionIndex] != null) {
+                            blockUpdates.add(PartialCulling.maskBlockLight(blockLight.getData(), surfaceResult.partialMasks()[blockSectionIndex]));
+                        } else {
+                            blockUpdates.add(blockLight.getData().clone());
+                        }
                     }
                 }
                 // blockState 0 (INIT_STATE_NULL) and 3 (INIT_STATE_HIDDEN): no entry
@@ -318,7 +338,10 @@ public final class FarChunkPacketBuilder {
                 // Sky Light
                 if (hasSkyLight) {
                     int skyState = ((StarlightSectionData) (Object) sd).starlight$getSkyLightState();
-                    if (skyState == 1) { // INIT_STATE_UNINIT
+                    if (isHidden && (skyState == 1 || skyState == 2)) {
+                        // anti-freecam: sky light would outline shafts and caves of the filled section
+                        emptySkyYMask.set(sectionIndex);
+                    } else if (skyState == 1) { // INIT_STATE_UNINIT
                         emptySkyYMask.set(sectionIndex);
                     } else if (skyState == 2) { // INIT_STATE_INIT
                         DataLayer skyLight = sd.skyLight();
@@ -326,7 +349,11 @@ public final class FarChunkPacketBuilder {
                             return null; // Corrupted light data
                         }
                         skyYMask.set(sectionIndex);
-                        skyUpdates.add(skyLight.getData().clone());
+                        if (isPartial && surfaceResult.partialMasks() != null && surfaceResult.partialMasks()[blockSectionIndex] != null) {
+                            skyUpdates.add(PartialCulling.maskBlockLight(skyLight.getData(), surfaceResult.partialMasks()[blockSectionIndex]));
+                        } else {
+                            skyUpdates.add(skyLight.getData().clone());
+                        }
                     }
                     // skyState 0 (INIT_STATE_NULL) and 3 (INIT_STATE_HIDDEN): no entry
                 }
@@ -357,7 +384,8 @@ public final class FarChunkPacketBuilder {
         try {
             int sectionCount = world.getSectionsCount();
             int minSectionY = world.getMinSectionY();
-            BitSet hiddenSections = EvdSurface.hiddenSections(live);
+            EvdSurface.Result surfaceResult = EvdSurface.compute(live);
+            BitSet hiddenSections = surfaceResult != null ? surfaceResult.hiddenSections() : null;
             LevelChunkSection[] rawSections = live.getSections();
             LevelChunkSection[] sections = new LevelChunkSection[sectionCount];
 
@@ -369,6 +397,11 @@ public final class FarChunkPacketBuilder {
                     // Borrow read-only until obfuscation needs to change this section.
                     sections[i] = raw;
                 }
+            }
+
+            BitSet copiedSections = new BitSet(sectionCount);
+            if (surfaceResult != null && surfaceResult.partialSections() != null) {
+                fillPartialSections(world, sections, sectionCount, surfaceResult, true, copiedSections);
             }
 
             int chunkX = live.getPos().x();
@@ -384,7 +417,7 @@ public final class FarChunkPacketBuilder {
             LevelChunkSection[] northSections = northChunk != null ? northChunk.getSections() : null;
             LevelChunkSection[] southSections = southChunk != null ? southChunk.getSections() : null;
 
-            obfuscateNonHiddenSections(world, sections, sectionCount, hiddenSections, true, westSections, eastSections, northSections, southSections);
+            obfuscateNonHiddenSections(world, sections, sectionCount, hiddenSections, true, copiedSections, westSections, eastSections, northSections, southSections);
 
             byte[] buffer = serializeSections(world, sections, sectionCount, hiddenSections);
             if (buffer == null) {
@@ -421,6 +454,9 @@ public final class FarChunkPacketBuilder {
                     if (hiddenSections != null && hiddenSections.get(sectionIndex)) {
                         continue;
                     }
+                    if (surfaceResult != null && surfaceResult.isCellFilled(pos.getX(), pos.getY(), pos.getZ())) {
+                        continue;
+                    }
                     if (hiddenBlocksSet != null && hiddenBlocksSet.contains(be.getBlockState().getBlock())) {
                         continue;
                     }
@@ -440,10 +476,15 @@ public final class FarChunkPacketBuilder {
                 heightmaps, buffer, blockEntitiesData
             );
 
-            // Light from light engine with hidden sections block light sent as empty
-            ClientboundLightUpdatePacketData lightData = new ClientboundLightUpdatePacketData(
-                live.getPos(), world.getLightEngine(), null, null, hiddenSections
-            );
+            ClientboundLightUpdatePacketData lightData;
+            if (surfaceResult != null && surfaceResult.partialSections() != null && surfaceResult.partialMasks() != null) {
+                lightData = buildLiveLightData(world, live.getPos(), hiddenSections, surfaceResult);
+            } else {
+                // Light from light engine with hidden sections block light sent as empty
+                lightData = new ClientboundLightUpdatePacketData(
+                    live.getPos(), world.getLightEngine(), null, null, hiddenSections
+                );
+            }
 
             return new ClientboundLevelChunkWithLightPacket(live.getPos().x(), live.getPos().z(), chunkData, lightData);
         } catch (Throwable t) {
@@ -485,12 +526,139 @@ public final class FarChunkPacketBuilder {
         return buffer;
     }
 
+    private static void fillPartialSections(
+        ServerLevel world,
+        LevelChunkSection[] sections,
+        int sectionCount,
+        EvdSurface.Result surfaceResult,
+        boolean copyOnWrite,
+        @Nullable BitSet copiedSections
+    ) {
+        BitSet partial = surfaceResult.partialSections();
+        int[] tileLimits = surfaceResult.tileLimits();
+        if (partial == null || tileLimits == null) {
+            return;
+        }
+
+        final long[][] masks = surfaceResult.partialMasks();
+        final Holder<Biome> uniformBiome = HiddenSectionWriter.uniformBiome(world);
+        for (int i = partial.nextSetBit(0); i >= 0 && i < sectionCount; i = partial.nextSetBit(i + 1)) {
+            LevelChunkSection section = sections[i];
+            if (section == null) {
+                continue;
+            }
+            if (copyOnWrite && (copiedSections == null || !copiedSections.get(i))) {
+                section = section.copy();
+                sections[i] = section;
+                if (copiedSections != null) {
+                    copiedSections.set(i);
+                }
+            }
+            int sectionY = world.getSectionYFromSectionIndex(i);
+            int bottomBlockY = sectionY << 4;
+            BlockState filler = HiddenSectionWriter.filler(world, sectionY);
+
+            for (int tileZ = 0; tileZ < 4; tileZ++) {
+                for (int tileX = 0; tileX < 4; tileX++) {
+                    int tileIndex = (tileZ << 2) | tileX;
+                    int cutoffY = tileLimits[tileIndex] - bottomBlockY;
+                    if (cutoffY <= 0) {
+                        continue;
+                    }
+                    int maxLocalY = Math.min(16, cutoffY);
+                    int startX = tileX << 2;
+                    int startZ = tileZ << 2;
+                    for (int localY = 0; localY < maxLocalY; localY++) {
+                        for (int z = startZ; z < startZ + 4; z++) {
+                            for (int x = startX; x < startX + 4; x++) {
+                                if (section.getBlockState(x, localY, z) != filler) {
+                                    section.setBlockState(x, localY, z, filler, false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // fully filled biome cells must not tell what is behind the filler (deep_dark, lush_caves ...)
+            if (masks != null && i < masks.length && masks[i] != null) {
+                BiomeMasking.apply(section, masks[i], uniformBiome);
+            }
+        }
+    }
+
+    private static ClientboundLightUpdatePacketData buildLiveLightData(
+        ServerLevel world,
+        ChunkPos chunkPos,
+        @Nullable BitSet hiddenSections,
+        EvdSurface.Result surfaceResult
+    ) {
+        LevelLightEngine lightEngine = world.getLightEngine();
+        int sectionCount = lightEngine.getLightSectionCount();
+        int bitSetSize = ((sectionCount + 63) >>> 6) << 6;
+        BitSet skyYMask = new BitSet(bitSetSize);
+        BitSet blockYMask = new BitSet(bitSetSize);
+        BitSet emptySkyYMask = new BitSet(bitSetSize);
+        BitSet emptyBlockYMask = new BitSet(bitSetSize);
+        boolean hasSkyLight = world.dimensionType().hasSkyLight();
+        List<byte[]> skyUpdates = hasSkyLight ? new ArrayList<>() : List.of();
+        List<byte[]> blockUpdates = new ArrayList<>();
+        int minLightSection = lightEngine.getMinLightSection();
+        LayerLightEventListener skyLayerListener = lightEngine.getLayerListener(LightLayer.SKY);
+        LayerLightEventListener blockLayerListener = lightEngine.getLayerListener(LightLayer.BLOCK);
+        int hiddenOffset = 1;
+        int worldSectionCount = world.getSectionsCount();
+
+        for (int sectionIndex = 0; sectionIndex < sectionCount; sectionIndex++) {
+            SectionPos sectionPos = SectionPos.of(chunkPos.x(), minLightSection + sectionIndex, chunkPos.z());
+            int blockSection = sectionIndex - hiddenOffset;
+            boolean isHidden = hiddenSections != null && blockSection >= 0 && blockSection < worldSectionCount && hiddenSections.get(blockSection);
+            boolean isPartial = surfaceResult.partialSections() != null && blockSection >= 0 && blockSection < worldSectionCount && surfaceResult.partialSections().get(blockSection);
+
+            if (hasSkyLight) {
+                DataLayer skyData = skyLayerListener.getDataLayerData(sectionPos);
+                if (skyData != null) {
+                    if (skyData.isEmpty() || isHidden) {
+                        emptySkyYMask.set(sectionIndex);
+                    } else {
+                        skyYMask.set(sectionIndex);
+                        if (isPartial && surfaceResult.partialMasks() != null && surfaceResult.partialMasks()[blockSection] != null) {
+                            skyUpdates.add(PartialCulling.maskBlockLight(skyData.getData(), surfaceResult.partialMasks()[blockSection]));
+                        } else {
+                            skyUpdates.add(skyData.getData().clone());
+                        }
+                    }
+                }
+            }
+
+            DataLayer blockData = blockLayerListener.getDataLayerData(sectionPos);
+            if (blockData != null) {
+                if (blockData.isEmpty() || isHidden) {
+                    emptyBlockYMask.set(sectionIndex);
+                } else {
+                    blockYMask.set(sectionIndex);
+                    if (isPartial && surfaceResult.partialMasks() != null && surfaceResult.partialMasks()[blockSection] != null) {
+                        blockUpdates.add(PartialCulling.maskBlockLight(blockData.getData(), surfaceResult.partialMasks()[blockSection]));
+                    } else {
+                        blockUpdates.add(blockData.getData().clone());
+                    }
+                }
+            }
+        }
+
+        return new ClientboundLightUpdatePacketData(
+            skyYMask, blockYMask, emptySkyYMask, emptyBlockYMask,
+            skyUpdates.isEmpty() ? List.of() : skyUpdates,
+            blockUpdates.isEmpty() ? List.of() : blockUpdates
+        );
+    }
+
     private static void obfuscateNonHiddenSections(
         ServerLevel world,
         LevelChunkSection[] sections,
         int sectionCount,
         @Nullable BitSet hiddenSections,
         boolean copyOnWrite,
+        @Nullable BitSet copiedSections,
         @Nullable LevelChunkSection[] westSections,
         @Nullable LevelChunkSection[] eastSections,
         @Nullable LevelChunkSection[] northSections,
@@ -518,7 +686,7 @@ public final class FarChunkPacketBuilder {
                 continue;
             }
 
-            boolean needsCopy = copyOnWrite;
+            boolean needsCopy = copyOnWrite && (copiedSections == null || !copiedSections.get(i));
             for (int y = 0; y < 16; y++) {
                 for (int z = 0; z < 16; z++) {
                     for (int x = 0; x < 16; x++) {
@@ -536,6 +704,9 @@ public final class FarChunkPacketBuilder {
                                 // Publish the copy before mutation so subsequent enclosure checks see it.
                                 section = section.copy();
                                 sections[i] = section;
+                                if (copiedSections != null) {
+                                    copiedSections.set(i);
+                                }
                                 needsCopy = false;
                             }
                             section.setBlockState(x, y, z, filler, false);

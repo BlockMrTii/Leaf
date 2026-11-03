@@ -7,6 +7,7 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.levelgen.Heightmap;
 import org.jspecify.annotations.Nullable;
 
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Map;
 
@@ -14,55 +15,71 @@ public final class EvdSurface {
 
     private EvdSurface() {}
 
+    public record Result(
+        @Nullable BitSet hiddenSections,
+        @Nullable BitSet partialSections,
+        int @Nullable [] tileLimits,
+        long @Nullable [][] partialMasks
+    ) {
+        public boolean isCellFilled(int blockX, int blockY, int blockZ) {
+            if (this.tileLimits == null) {
+                return false;
+            }
+            int localX = blockX & 15;
+            int localZ = blockZ & 15;
+            int tileIndex = ((localZ >> 2) << 2) | (localX >> 2);
+            return blockY < this.tileLimits[tileIndex];
+        }
+    }
+
     /**
-     * Determines sections whose top block level is strictly below the lowest WORLD_SURFACE heightmap
-     * value across all 256 columns of the chunk, minus an additional one-section safety buffer.
-     * <p>
-     * Rationale for the safety buffer:
-     * Leaving the section directly beneath the lowest surface point intact prevents visual artifacts
-     * (e.g. cut-offs, solid stone ceiling showing through valleys, overhangs, ravines or shallow caves
-     * that reach just below the surface) when distant chunks are rendered from elevated angles, while
-     * keeping deep underground caves and player bases fully concealed.
-     *
-     * @param chunk the live level chunk
-     * @return BitSet of section indices (0..sectionCount - 1) to hide, or null if none
+     * Preserved for backwards compatibility with existing callers.
      */
     public static @Nullable BitSet hiddenSections(LevelChunk chunk) {
-        // the highest non-air block of a dimension with a ceiling is its roof, the whole world would count as underground
+        Result res = compute(chunk);
+        return res != null ? res.hiddenSections() : null;
+    }
+
+    /**
+     * Preserved for backwards compatibility with existing callers.
+     */
+    public static @Nullable BitSet hiddenSections(ServerLevel level, Map<Heightmap.Types, long[]> rawHeightmaps) {
+        Result res = compute(level, rawHeightmaps);
+        return res != null ? res.hiddenSections() : null;
+    }
+
+    /**
+     * Computes surface tile limits, fully hidden sections, and partially filled sections with cell masks for a live chunk.
+     */
+    public static @Nullable Result compute(LevelChunk chunk) {
         if (chunk == null || chunk.getLevel().dimensionType().hasCeiling()) {
             return null;
         }
 
-        int minSurfaceHeight = Integer.MAX_VALUE;
-        for (int x = 0; x < 16; x++) {
-            for (int z = 0; z < 16; z++) {
-                int h = chunk.getHeight(Heightmap.Types.WORLD_SURFACE, x, z);
-                if (h < minSurfaceHeight) {
-                    minSurfaceHeight = h;
-                }
+        int[] surfaceHeights = new int[256];
+        for (int z = 0; z < 16; z++) {
+            for (int x = 0; x < 16; x++) {
+                // without leaves: WORLD_SURFACE counts the crown of a big tree as ground and would fill the air and soil below it
+                surfaceHeights[(z << 4) | x] = chunk.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
             }
         }
 
-        return computeHiddenSections(chunk.getSectionsCount(), chunk.getMinSectionY(), minSurfaceHeight);
+        return compute(chunk.getSectionsCount(), chunk.getMinSectionY(), surfaceHeights);
     }
 
     /**
-     * Determines sections to hide using raw, parsed heightmap data (e.g. from SerializableChunkData.heightmaps()).
-     * <p>
-     * If WORLD_SURFACE data is missing or corrupted, returns null conservatively without guessing
-     * or modifying sections.
-     *
-     * @param level the server level
-     * @param rawHeightmaps raw heightmap arrays mapped by heightmap type
-     * @return BitSet of section indices (0..sectionCount - 1) to hide, or null if none
+     * Computes surface tile limits, fully hidden sections, and partially filled sections with cell masks from raw NBT heightmaps.
      */
-    public static @Nullable BitSet hiddenSections(ServerLevel level, Map<Heightmap.Types, long[]> rawHeightmaps) {
-        // see above, a ceiling (nether roof) would hide the whole dimension
+    public static @Nullable Result compute(ServerLevel level, Map<Heightmap.Types, long[]> rawHeightmaps) {
         if (level == null || rawHeightmaps == null || level.dimensionType().hasCeiling()) {
             return null;
         }
 
-        long[] rawData = rawHeightmaps.get(Heightmap.Types.WORLD_SURFACE);
+        // same height source as the live path, WORLD_SURFACE only as a fallback for data without it
+        long[] rawData = rawHeightmaps.get(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES);
+        if (rawData == null) {
+            rawData = rawHeightmaps.get(Heightmap.Types.WORLD_SURFACE);
+        }
         if (rawData == null) {
             return null;
         }
@@ -76,30 +93,100 @@ public final class EvdSurface {
         }
 
         int minY = level.getMinY();
-        int minSurfaceHeight = Integer.MAX_VALUE;
+        int[] surfaceHeights = new int[256];
         for (int i = 0; i < 256; i++) {
-            // Heightmap values in storage represent (firstAvailableY - minY)
-            // The highest non-air block Y is therefore (value + minY - 1)
-            int surfaceY = storage.get(i) + minY - 1;
-            if (surfaceY < minSurfaceHeight) {
-                minSurfaceHeight = surfaceY;
-            }
+            // storage holds firstAvailableY - minY; ChunkAccess#getHeight (live path) returns firstAvailableY - 1
+            surfaceHeights[i] = storage.get(i) + minY - 1;
         }
 
-        return computeHiddenSections(level.getSectionsCount(), level.getMinSectionY(), minSurfaceHeight);
+        return compute(level.getSectionsCount(), level.getMinSectionY(), surfaceHeights);
     }
 
-    private static @Nullable BitSet computeHiddenSections(int sectionCount, int minSectionY, int minSurfaceHeight) {
-        BitSet bitSet = new BitSet(sectionCount);
-        for (int i = 0; i < sectionCount; i++) {
-            int sectionY = minSectionY + i;
-            int topBlockY = (sectionY << 4) + 15;
-            // The top block of the section must be below the lowest surface height,
-            // with a 1-section (16-block) safety margin buffer below the lowest surface section.
-            if (topBlockY + 16 < minSurfaceHeight) {
-                bitSet.set(i);
+    /**
+     * Pure function: calculates 4x4 tile boundaries (min WORLD_SURFACE of 16 columns - 16 blocks safety buffer)
+     * and decides which sections are fully hidden or partially filled.
+     */
+    public static @Nullable Result compute(int sectionCount, int minSectionY, int[] surfaceHeights) {
+        if (surfaceHeights == null || surfaceHeights.length != 256) {
+            return null;
+        }
+
+        int[] tileLimits = new int[16];
+        Arrays.fill(tileLimits, Integer.MAX_VALUE);
+
+        for (int z = 0; z < 16; z++) {
+            for (int x = 0; x < 16; x++) {
+                int h = surfaceHeights[(z << 4) | x];
+                int t = ((z >> 2) << 2) | (x >> 2);
+                if (h < tileLimits[t]) {
+                    tileLimits[t] = h;
+                }
             }
         }
-        return bitSet.isEmpty() ? null : bitSet;
+
+        int minTileLimit = Integer.MAX_VALUE;
+        int maxTileLimit = Integer.MIN_VALUE;
+        for (int t = 0; t < 16; t++) {
+            tileLimits[t] -= 16;
+            if (tileLimits[t] < minTileLimit) {
+                minTileLimit = tileLimits[t];
+            }
+            if (tileLimits[t] > maxTileLimit) {
+                maxTileLimit = tileLimits[t];
+            }
+        }
+
+        BitSet hiddenSections = new BitSet(sectionCount);
+        BitSet partialSections = new BitSet(sectionCount);
+        long[][] partialMasks = null;
+
+        for (int i = 0; i < sectionCount; i++) {
+            int sectionY = minSectionY + i;
+            int bottomBlockY = sectionY << 4;
+            int topBlockY = bottomBlockY + 15;
+
+            if (topBlockY < minTileLimit) {
+                hiddenSections.set(i);
+            } else if (bottomBlockY < maxTileLimit) {
+                boolean hasCut = false;
+                for (int t = 0; t < 16; t++) {
+                    if (tileLimits[t] > bottomBlockY) {
+                        hasCut = true;
+                        break;
+                    }
+                }
+                if (hasCut) {
+                    partialSections.set(i);
+                    if (partialMasks == null) {
+                        partialMasks = new long[sectionCount][];
+                    }
+                    long[] mask = new long[64];
+                    for (int z = 0; z < 16; z++) {
+                        for (int x = 0; x < 16; x++) {
+                            int t = ((z >> 2) << 2) | (x >> 2);
+                            int cutoffY = tileLimits[t] - bottomBlockY;
+                            if (cutoffY <= 0) {
+                                continue;
+                            }
+                            int maxLocalY = Math.min(16, cutoffY);
+                            for (int y = 0; y < maxLocalY; y++) {
+                                int index = (y << 8) | (z << 4) | x;
+                                mask[index >>> 6] |= (1L << (index & 63));
+                            }
+                        }
+                    }
+                    partialMasks[i] = mask;
+                }
+            }
+        }
+
+        BitSet finalHidden = hiddenSections.isEmpty() ? null : hiddenSections;
+        BitSet finalPartial = partialSections.isEmpty() ? null : partialSections;
+
+        if (finalHidden == null && finalPartial == null) {
+            return null;
+        }
+
+        return new Result(finalHidden, finalPartial, tileLimits, partialMasks);
     }
 }

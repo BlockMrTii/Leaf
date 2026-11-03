@@ -9,6 +9,7 @@ import it.unimi.dsi.fastutil.longs.LongLinkedOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.server.level.ServerPlayer;
 import org.dreeam.leaf.config.modules.misc.AntiFreecam;
+import org.jspecify.annotations.Nullable;
 import java.util.Arrays;
 import java.util.BitSet;
 
@@ -16,6 +17,7 @@ import java.util.BitSet;
 final class PlayerVisibility {
     // Ordered by decreasing client visibility, allowing reveal/re-hide comparisons without allocation.
     static final int UNKNOWN = -1, REAL = 0, PARTIAL = 1, HIDDEN = 2;
+    static final int STALE = -2;
     private static final int MOVEMENT_REBUILD_INTERVAL = 10;
     private static final int MAX_FRONTIER_NODES = 65536;
     private static final int MAX_CONTINUATION_QUEUE = 131072;
@@ -41,7 +43,12 @@ final class PlayerVisibility {
     int workX, workY, workZ, workRadius, workWidth, workHeight, workMinY;
     int requestedX = Integer.MIN_VALUE, requestedY, requestedZ, requestedRadius;
     long[] visible = new long[0], reachable = new long[0], work = new long[0], queue = new long[1024];
-    byte[] visited = new byte[0], completedVisited = new byte[0];
+    // Two words hold 15 components * 6 incoming faces per section slot.
+    long[] visited = new long[0], completedVisited = new long[0];
+    private short[] reachedComponents = new short[0], workReachedComponents = new short[0];
+    private short[] allComponents = new short[0], workAllComponents = new short[0];
+    private int[] componentIds = new int[0], workComponentIds = new int[0];
+    private int eyeCell, workEyeCell;
     private ConnectivityCache.Column[] columns = new ConnectivityCache.Column[0], workColumns = new ConnectivityCache.Column[0];
     private long[] columnPasses = new long[0], workColumnPasses = new long[0];
     private int[] surfaceSections = new int[0];
@@ -74,6 +81,12 @@ final class PlayerVisibility {
     }
     static final class SentChunk {
         BitSet hidden, partial;
+        // Written only by AntiFreecamManager: per section, filler cells held by the client (null = none).
+        long @Nullable [][] masks;
+        // Component part of masks, used to diff against current reachability (null = none).
+        long @Nullable [][] componentMasks;
+        // Pending component re-hide start ticks, -1 = none; allocated lazily by the manager.
+        long @Nullable [] culledSince;
         int maskState(final int section) {
             return this.hidden != null && this.hidden.get(section) ? HIDDEN
                 : this.partial != null && this.partial.get(section) ? PARTIAL : REAL;
@@ -127,6 +140,28 @@ final class PlayerVisibility {
         }
         return cy >= surfaceSection ? PARTIAL : HIDDEN;
     }
+    /** Uses the same completed/work selection as maskStateForSend; STALE rejects rebuilt component labels. */
+    int reachedBitsForSend(final int cx, final int cy, final int cz, final SectionConnectivity.Components current) {
+        if (this.bypass || this.nearPlayer(cx, cy, cz)) return -1;
+        if (this.contains(cx, cy, cz)) return this.reachedBits(cx, cy, cz, current);
+        if (!this.running || !this.workContains(cx, cy, cz)) return -1;
+        final int index = ((cz - this.workZ + this.workRadius) * this.workWidth + cx - this.workX + this.workRadius) * this.workHeight + cy - this.workMinY;
+        final int all = this.workAllComponents[index];
+        if (all == 0) return -1;
+        if (this.workComponentIds[index] != current.id()) return STALE;
+        final int reached = this.workReachedComponents[index];
+        return reached == all ? -1 : reached;
+    }
+    /** Completed reachability, or STALE after a rebuild; near-player and out-of-window cells stay unmasked. */
+    int reachedBits(final int cx, final int cy, final int cz, final SectionConnectivity.Components current) {
+        if (this.bypass || this.nearPlayer(cx, cy, cz) || !this.contains(cx, cy, cz)) return -1;
+        final int index = this.index(cx, cy, cz);
+        final int all = this.allComponents[index];
+        if (all == 0) return -1;
+        if (this.componentIds[index] != current.id()) return STALE;
+        final int reached = this.reachedComponents[index];
+        return reached == all ? -1 : reached;
+    }
     boolean resultIsCurrent() {
         return this.hasResult && this.x == this.requestedX && this.y == this.requestedY && this.z == this.requestedZ && this.radius == this.requestedRadius;
     }
@@ -152,8 +187,19 @@ final class PlayerVisibility {
         this.workX = cx; this.workY = cy; this.workZ = cz; this.workRadius = radius;
         this.workWidth = radius * 2 + 1; this.workHeight = height; this.workMinY = minY;
         final int count = this.workWidth * this.workWidth * height;
-        if (this.visited.length != count) this.visited = new byte[count];
-        else Arrays.fill(this.visited, (byte)0);
+        if (this.visited.length != count * 2) this.visited = new long[count * 2];
+        else Arrays.fill(this.visited, 0L);
+        if (this.workReachedComponents.length != count) {
+            this.workReachedComponents = new short[count];
+            this.workAllComponents = new short[count];
+            this.workComponentIds = new int[count];
+        } else {
+            Arrays.fill(this.workReachedComponents, (short)0);
+            Arrays.fill(this.workAllComponents, (short)0);
+            Arrays.fill(this.workComponentIds, 0);
+        }
+        this.workEyeCell = (((int)Math.floor(this.player.getEyeY()) & 15) << 8)
+            | (((int)Math.floor(this.player.getZ()) & 15) << 4) | ((int)Math.floor(this.player.getX()) & 15);
         final int words = (count + 63) >>> 6;
         if (this.work.length != words) this.work = new long[words];
         else Arrays.fill(this.work, 0L);
@@ -168,7 +214,8 @@ final class PlayerVisibility {
         this.workFrontier.clear();
         this.head = this.tail = 0;
         final int root = ((cz - this.workZ + radius) * this.workWidth + cx - this.workX + radius) * height + cy - minY;
-        this.enqueue(((long)root << 9) | 6L, true);
+        // Component 15 is the root sentinel, resolved only after its chunk is available.
+        this.enqueue(((long)root << 13) | (15L << 9) | 6L, true);
         this.lastFullStartTick = tick;
         this.dirty = false; this.running = true;
     }
@@ -308,6 +355,7 @@ final class PlayerVisibility {
         this.request(minY, height, tick, true);
         // Overflow recovery must stay in the regular tick budget, not trigger a large synchronous rebuild.
         if (this.continuationOverflow) return;
+        // Keep the pre-component synchronous ceiling; remaining components use the regular tick budget.
         long remaining = (long)this.workWidth * this.workWidth * this.workHeight * 6L + 1L;
         while (remaining > 0) {
             final int slice = (int)Math.min(8192L, remaining);
@@ -320,30 +368,61 @@ final class PlayerVisibility {
         final int centerX = working ? this.workX : this.x, centerZ = working ? this.workZ : this.z;
         final int radius = working ? this.workRadius : this.radius, width = working ? this.workWidth : this.width;
         final int height = working ? this.workHeight : this.height, minY = working ? this.workMinY : this.minY;
-        final byte[] visited = working ? this.visited : this.completedVisited;
+        final long[] visited = working ? this.visited : this.completedVisited;
         final long[] bits = working ? this.work : this.reachable;
+        final short[] reached = working ? this.workReachedComponents : this.reachedComponents;
+        final short[] all = working ? this.workAllComponents : this.allComponents;
+        final int[] componentIds = working ? this.workComponentIds : this.componentIds;
         final Frontier frontier = working ? this.workFrontier : this.frontier;
-        final int index = (int)(node >>> 9), entry = (int)node & 7, used = (int)(node >>> 3) & 63;
+        final int index = (int)(node >>> 13), component = (int)(node >>> 9) & 15;
+        final int used = (int)(node >>> 3) & 63;
         final int section = index % height, columnIndex = index / height;
         final int sy = section + minY, sx = columnIndex % width + centerX - radius, sz = columnIndex / width + centerZ - radius;
         final long key = ConnectivityCache.key(sx, sz);
         final ConnectivityCache.Column column = this.column(cache, columnIndex, working);
         if (column == null) { frontier.add(key, node); return; }
+        final SectionConnectivity.Components components = cache.components(column, section);
+        // Keep queued labels and already accumulated bits bound to one component generation.
+        if (componentIds[index] != 0 && componentIds[index] != components.id()) { this.dirty = true; return; }
+        componentIds[index] = components.id();
+        all[index] = (short)components.allBits();
+        if (component == 15) {
+            final int eyeComponent = components.componentAt(working ? this.workEyeCell : this.eyeCell);
+            for (int rootComponent = 0; rootComponent < components.count(); ++rootComponent) {
+                if (eyeComponent >= 0 && rootComponent != eyeComponent) continue;
+                this.enqueue(((long)index << 13) | ((long)rootComponent << 9) | 6L, working);
+            }
+            return;
+        }
+        // A topology edit can leave queued component ids obsolete until the next full rebuild.
+        if (component >= components.count()) { this.dirty = true; return; }
         bits[index >>> 6] |= 1L << index;
-        final short mask = cache.mask(column, section);
+        reached[index] |= (short)(1 << component);
         for (int direction = 0; direction < 6; ++direction) {
-            if ((used & 1 << (direction ^ 1)) != 0 || (entry != 6 && !SectionConnectivity.isConnected(mask, entry, direction))) continue;
+            if ((used & 1 << (direction ^ 1)) != 0 || !components.hasPortal(component, direction)) continue;
             final int nx = sx + DX[direction], ny = sy + DY[direction], nz = sz + DZ[direction];
             if (nx < centerX - radius || nx > centerX + radius || nz < centerZ - radius || nz > centerZ + radius || ny < minY || ny >= minY + height) continue;
             final int nextColumn = (nz - centerZ + radius) * width + nx - centerX + radius;
             final int next = nextColumn * height + ny - minY, incoming = direction ^ 1;
-            final long nextKey = ConnectivityCache.key(nx, nz);
-            final boolean loaded = this.column(cache, nextColumn, working) != null;
-            if ((visited[next] & 1 << incoming) != 0) continue;
-            visited[next] |= (byte)(1 << incoming);
-            final long nextNode = ((long)next << 9) | ((long)(used | 1 << direction) << 3) | incoming;
-            if (!loaded) frontier.add(nextKey, nextNode);
-            else if (!this.enqueue(nextNode, working)) visited[next] &= (byte)~(1 << incoming);
+            final ConnectivityCache.Column nextColumnData = this.column(cache, nextColumn, working);
+            if (nextColumnData == null) {
+                // Replay the source component: the unloaded target's labels and portals are unknown.
+                frontier.add(ConnectivityCache.key(nx, nz), node);
+                continue;
+            }
+            final SectionConnectivity.Components nextComponents = cache.components(nextColumnData, ny - minY);
+            if (componentIds[next] != 0 && componentIds[next] != nextComponents.id()) { this.dirty = true; continue; }
+            for (int nextComponent = 0; nextComponent < nextComponents.count(); ++nextComponent) {
+                final int visit = nextComponent * 6 + incoming;
+                final int word = next * 2 + (visit >>> 6);
+                final long visitBit = 1L << visit;
+                if ((visited[word] & visitBit) != 0 || !components.overlaps(component, direction, nextComponents, nextComponent)) continue;
+                final long nextNode = ((long)next << 13) | ((long)nextComponent << 9) | ((long)(used | 1 << direction) << 3) | incoming;
+                if (this.enqueue(nextNode, working)) {
+                    componentIds[next] = nextComponents.id();
+                    visited[word] |= visitBit;
+                }
+            }
         }
     }
     boolean advance(final ConnectivityCache cache, final int budget) {
@@ -358,7 +437,11 @@ final class PlayerVisibility {
             return false;
         }
         final long[] old = this.reachable; this.reachable = this.work; this.work = old;
-        final byte[] oldVisited = this.completedVisited; this.completedVisited = this.visited; this.visited = oldVisited;
+        final long[] oldVisited = this.completedVisited; this.completedVisited = this.visited; this.visited = oldVisited;
+        final short[] oldReached = this.reachedComponents; this.reachedComponents = this.workReachedComponents; this.workReachedComponents = oldReached;
+        final short[] oldAll = this.allComponents; this.allComponents = this.workAllComponents; this.workAllComponents = oldAll;
+        final int[] oldIds = this.componentIds; this.componentIds = this.workComponentIds; this.workComponentIds = oldIds;
+        this.eyeCell = this.workEyeCell;
         final ConnectivityCache.Column[] oldColumns = this.columns; this.columns = this.workColumns; this.workColumns = oldColumns;
         final long[] oldPasses = this.columnPasses; this.columnPasses = this.workColumnPasses; this.workColumnPasses = oldPasses;
         final Frontier oldFrontier = this.frontier; this.frontier = this.workFrontier; this.workFrontier = oldFrontier;

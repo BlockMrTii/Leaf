@@ -2,10 +2,12 @@ package org.dreeam.leaf.world.antifreecam;
 
 import io.netty.buffer.Unpooled;
 import java.util.Arrays;
+import net.minecraft.core.Holder;
 import net.minecraft.core.SectionPos;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.DataLayer;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -21,8 +23,9 @@ import org.jspecify.annotations.Nullable;
  * and ores in rock become filler, while the surface skin and everything lit by the sky stays real. The result only
  * depends on the chunk, so it is computed once per section and shared by all players.
  * <p>
- * The cell mask that was used for a packet is kept and used by every later filter (block entities, block updates,
- * effects, block light), so the filters always agree with what the client holds. When sky light changes and the mask
+ * The cell mask that was sent to a player (this mask, a mask of unreached components or their intersection) is kept
+ * per player by the manager and used by every later filter (block entities, block updates, effects, block light),
+ * so the filters always agree with what the client holds. When sky light changes and the mask
  * changes with it, the players holding the section are sent the chunk again.
  * <p>
  * Tick thread only.
@@ -58,10 +61,14 @@ public final class PartialCulling {
     private static final class Entry {
         // null if no cell is culled
         long @Nullable [] mask;
-        // serialized section with the culled cells replaced, created lazily and dropped on block changes
-        byte @Nullable [] data;
         long computedTick;
     }
+
+    // a serialized section for one cell mask; masks are never mutated, so equal masks share their bytes
+    private record Variant(long[] mask, byte[] data) {}
+    private static final int MAX_VARIANTS = 4;
+    // serialized sections per section key, most recently created first, dropped on block changes
+    private final it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<Variant[]> variants = new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();
 
     /**
      * Sky light of one section following Starlight's semantics: a missing nibble takes the bottom row of the nearest
@@ -196,7 +203,6 @@ public final class PartialCulling {
                 entry.computedTick = tick;
                 if (!Arrays.equals(mask, entry.mask)) {
                     entry.mask = mask;
-                    this.dropData(key, entry);
                     this.listener.onPartialSectionChanged(chunkX, sectionY, chunkZ);
                 }
             }
@@ -231,42 +237,45 @@ public final class PartialCulling {
     }
 
     /**
-     * @return the network serialization of the section with its culled cells replaced by filler, or {@code null} if
-     * no cell is culled and the real section must be sent
+     * @return the network serialization of the section with the cells of {@code mask} replaced by filler. The mask is
+     * the one the player receives (sky light cells, unreached components or both) and must not be mutated afterwards.
      */
-    public byte @Nullable [] serialize(final LevelChunk chunk, final int sectionIndex, final long tick) {
+    public byte[] serialize(final LevelChunk chunk, final int sectionIndex, final long[] mask) {
         final int chunkX = chunk.getPos().x();
         final int chunkZ = chunk.getPos().z();
         final int sectionY = chunk.getSectionYFromSectionIndex(sectionIndex);
-        final Entry entry = this.entry(chunkX, sectionY, chunkZ, tick, true);
-        if (entry == null || entry.mask == null) {
-            return null;
-        }
         final long key = SectionPos.asLong(chunkX, sectionY, chunkZ);
-        if (entry.data == null) {
-            entry.data = serialize(chunk.getSections()[sectionIndex], entry.mask, HiddenSectionWriter.filler(this.level, sectionY), sectionIndex);
-            this.serialized.addAndMoveToLast(key);
-            while (this.serialized.size() > MAX_SERIALIZED) {
-                final Entry oldest = this.entries.get(this.serialized.removeFirstLong());
-                if (oldest != null) {
-                    // only the bytes are dropped, the mask the players hold stays
-                    oldest.data = null;
+        Variant[] list = this.variants.get(key);
+        if (list != null) {
+            for (int i = 0; i < MAX_VARIANTS; ++i) {
+                final Variant variant = list[i];
+                if (variant != null && (variant.mask() == mask || Arrays.equals(variant.mask(), mask))) {
+                    this.serialized.addAndMoveToLast(key);
+                    return variant.data();
                 }
             }
         } else {
-            this.serialized.addAndMoveToLast(key);
+            list = new Variant[MAX_VARIANTS];
+            this.variants.put(key, list);
         }
-        return entry.data;
+        final byte[] data = serialize(chunk.getSections()[sectionIndex], mask, HiddenSectionWriter.filler(this.level, sectionY), HiddenSectionWriter.uniformBiome(this.level), sectionIndex);
+        System.arraycopy(list, 0, list, 1, MAX_VARIANTS - 1);
+        list[0] = new Variant(mask, data);
+        this.serialized.addAndMoveToLast(key);
+        while (this.serialized.size() > MAX_SERIALIZED) {
+            // only the bytes are dropped, the masks the players hold stay with the players
+            this.variants.remove(this.serialized.removeFirstLong());
+        }
+        return data;
     }
 
-    private void dropData(final long key, final Entry entry) {
-        if (entry.data != null) {
-            entry.data = null;
+    private void dropData(final long key) {
+        if (this.variants.remove(key) != null) {
             this.serialized.remove(key);
         }
     }
 
-    private static byte[] serialize(final LevelChunkSection real, final long[] mask, final BlockState filler, final int sectionIndex) {
+    private static byte[] serialize(final LevelChunkSection real, final long[] mask, final BlockState filler, final Holder<Biome> uniformBiome, final int sectionIndex) {
         final LevelChunkSection copy = real.copy();
         for (int word = 0; word < MASK_WORDS; ++word) {
             long bits = mask[word];
@@ -276,6 +285,8 @@ public final class PartialCulling {
                 copy.setBlockState(index & 15, index >>> 8, (index >>> 4) & 15, filler, false);
             }
         }
+        // biomes of fully culled biome cells would still tell what is behind the filler, e.g. deep_dark or lush_caves
+        BiomeMasking.apply(copy, mask, uniformBiome);
         final byte[] data = new byte[copy.getSerializedSize()];
         final FriendlyByteBuf buffer = new FriendlyByteBuf(Unpooled.wrappedBuffer(data));
         buffer.writerIndex(0);
@@ -308,14 +319,10 @@ public final class PartialCulling {
      * The serialized section is outdated, the mask only changes with the light (see {@link #onSkyLightChanged}).
      */
     public void onBlockChanged(final int blockX, final int blockY, final int blockZ) {
-        if (this.entries.isEmpty()) {
+        if (this.variants.isEmpty()) {
             return;
         }
-        final long key = SectionPos.asLong(blockX >> 4, blockY >> 4, blockZ >> 4);
-        final Entry entry = this.entries.get(key);
-        if (entry != null) {
-            this.dropData(key, entry);
-        }
+        this.dropData(SectionPos.asLong(blockX >> 4, blockY >> 4, blockZ >> 4));
     }
 
     /**
@@ -345,7 +352,6 @@ public final class PartialCulling {
         entry.computedTick = tick;
         if (!Arrays.equals(mask, entry.mask)) {
             entry.mask = mask;
-            this.dropData(key, entry);
             this.listener.onPartialSectionChanged(chunkX, sectionY, chunkZ);
         }
     }
@@ -373,7 +379,7 @@ public final class PartialCulling {
     }
 
     public void onChunkUnload(final int chunkX, final int chunkZ) {
-        if (this.entries.isEmpty()) {
+        if (this.entries.isEmpty() && this.variants.isEmpty()) {
             return;
         }
         final int minSection = this.level.getMinSectionY();
@@ -381,6 +387,7 @@ public final class PartialCulling {
         for (int sectionY = minSection; sectionY <= maxSection; ++sectionY) {
             final long key = SectionPos.asLong(chunkX, sectionY, chunkZ);
             this.entries.remove(key);
+            this.variants.remove(key);
             this.serialized.remove(key);
         }
         // the neighbours keep their masks: the players hold exactly those, and every filter uses them
@@ -389,6 +396,7 @@ public final class PartialCulling {
     public void clear() {
         this.entries.clear();
         this.entries.trim();
+        this.variants.clear();
         this.serialized.clear();
         this.pendingChanges.clear();
     }
