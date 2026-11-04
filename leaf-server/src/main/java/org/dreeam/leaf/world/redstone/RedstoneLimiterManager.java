@@ -6,9 +6,36 @@ import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.world.level.ChunkPos;
 import org.dreeam.leaf.config.LeafConfig;
 import org.dreeam.leaf.config.modules.opt.RedstoneLimiter;
+import org.jspecify.annotations.Nullable;
 
-/** Per-world accounting, accessed only by the world's tick thread. */
+import java.lang.ref.WeakReference;
+import java.util.concurrent.ConcurrentHashMap;
+
+/** Per-world accounting on the world's tick thread; only published statistics may be read from other threads. */
 public final class RedstoneLimiterManager {
+
+    // Weak references: the world owns its manager, an unloaded world must not be kept alive by this lookup table.
+    private static final ConcurrentHashMap<String, WeakReference<RedstoneLimiterManager>> MANAGERS = new ConcurrentHashMap<>();
+
+    public record Stats(
+        boolean measuring,
+        boolean throttling,
+        double redstoneMs,
+        int hotChunks,
+        int throttledChunks,
+        int groups,
+        boolean hasHottest,
+        int hottestChunkX,
+        int hottestChunkZ,
+        double hottestMs
+    ) {
+        public static final Stats EMPTY = new Stats(false, false, 0.0, 0, 0, 0, false, 0, 0, 0.0);
+    }
+
+    private volatile Stats publishedStats = Stats.EMPTY;
+    private long worldTickNanos;
+    private double worldEmaMs;
+    private int ticksSinceStats;
 
     private static final long DEBT_LIMIT_FACTOR = 2L;
     private static final long ACTIVITY_WINDOW_TICKS = 100L; // a chunk counts as running redstone for this long after its last scheduled tick
@@ -46,6 +73,21 @@ public final class RedstoneLimiterManager {
 
     public RedstoneLimiterManager(String worldName) {
         this.worldName = worldName;
+        if (worldName != null) {
+            MANAGERS.put(worldName, new WeakReference<>(this));
+        }
+    }
+
+    public static @Nullable RedstoneLimiterManager forWorld(String worldName) {
+        if (worldName == null) {
+            return null;
+        }
+        final WeakReference<RedstoneLimiterManager> reference = MANAGERS.get(worldName);
+        return reference == null ? null : reference.get();
+    }
+
+    public Stats stats() {
+        return this.publishedStats;
     }
 
     public boolean isLocalActive() {
@@ -136,6 +178,7 @@ public final class RedstoneLimiterManager {
         if (!RedstoneLimiter.enabled || (!RedstoneLimiter.chunkThrottling && !RedstoneLimiter.monitorOnly) || nanos <= 0) {
             return;
         }
+        this.worldTickNanos += Math.min(nanos, Long.MAX_VALUE - this.worldTickNanos);
         if (!this.groups.isEmpty() && this.isLocalActive()) {
             Group group = this.memberGroup.get(chunkKey);
             if (group != null) {
@@ -163,6 +206,8 @@ public final class RedstoneLimiterManager {
             this.clearTracking();
             return;
         }
+        this.worldEmaMs += 0.2 * (this.worldTickNanos / 1_000_000.0 - this.worldEmaMs);
+        this.worldTickNanos = 0;
         int window = Math.max(1, RedstoneLimiter.emaWindowTicks);
         double alpha = 2.0 / (window + 1.0);
         double decay = 1.0 - alpha;
@@ -191,6 +236,10 @@ public final class RedstoneLimiterManager {
             group.admittedEstimateNanos = 0;
         }
 
+        int hotChunks = 0;
+        boolean hasHottest = false;
+        long hottestChunk = 0;
+        double hottestMs = 0.0;
         ChunkState state = this.pending;
         while (state != null) {
             ChunkState next = state.next;
@@ -222,6 +271,14 @@ public final class RedstoneLimiterManager {
                 this.groupsDirty = true;
                 this.logTransition(state, gameTime, state.hot);
             }
+            if (state.emaMs > hottestMs) {
+                hasHottest = true;
+                hottestChunk = state.chunkKey;
+                hottestMs = state.emaMs;
+            }
+            if (state.hot) {
+                ++hotChunks;
+            }
             if (!state.hot) {
                 // the state stays in the map (not queued) so its activity can still count for spreading, the sweep removes it later
                 this.unlink(state);
@@ -240,6 +297,12 @@ public final class RedstoneLimiterManager {
         }
         if (this.groupsDirty) {
             this.rebuildGroups(gameTime, allowance, localActive);
+        }
+        Stats previousStats = this.publishedStats;
+        if (++this.ticksSinceStats >= 10 || !previousStats.measuring() || previousStats.throttling() != localActive) {
+            this.publishedStats = new Stats(true, localActive, this.worldEmaMs, hotChunks, this.memberGroup.size(),
+                this.groups.size(), hasHottest, ChunkPos.getX(hottestChunk), ChunkPos.getZ(hottestChunk), hottestMs);
+            this.ticksSinceStats = 0;
         }
         this.lastTick = gameTime;
         this.hasTick = true;
@@ -386,6 +449,10 @@ public final class RedstoneLimiterManager {
     }
 
     private void clearTracking() {
+        this.worldTickNanos = 0;
+        this.worldEmaMs = 0.0;
+        this.ticksSinceStats = 0;
+        this.publishedStats = Stats.EMPTY;
         this.chunks.clear();
         this.memberGroup.clear();
         this.memberSpare.clear();
