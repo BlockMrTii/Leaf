@@ -14,6 +14,11 @@ public class RedstoneLimiter extends ConfigModule {
     public static double executionBudgetMs = 5.0;
     public static boolean chunkThrottling = true;
     public static boolean slowPistons = false;
+    public static boolean virtualTime = false;
+    public static double minSpeed = 0.1;
+    public static double catchUpSpeed = 1.5;
+    public static boolean slowBlockEntities = true;
+    public static boolean virtualLookahead = false;
     public static double chunkBudgetMs = 2.0;
     public static double groupBudgetMs = 2.0;
     public static int neighborRadius = 1;
@@ -107,6 +112,66 @@ public class RedstoneLimiter extends ConfigModule {
                 """
                 同时节流活塞方块事件.
                 警告: 会改变活塞机械和复制机的时序，仅在充分测试后启用!"""
+            )
+        );
+
+        virtualTime = globalConfig.getBoolean(basePath() + ".virtual-time", virtualTime,
+            globalConfig.pickStringRegionBased(
+                """
+                Virtual chunk time (experimental). Instead of the time account, every throttled group gets its own clock that runs slower than the server (like /tick rate for just that area).
+                The group runs only some server ticks (a whole group tick is skipped, nothing partial) and all delays of scheduled block ticks inside it are measured in the group's own time,
+                so repeaters, torches, observers etc. stay in sync with each other and just run at a lower speed. Piston block events are slowed with it (slow-pistons is not needed),
+                and so are block entities if slow-block-entities is on.
+                The speed of a group is group-budget-ms divided by its measured cost per executed tick, limited by min-speed.
+                Entities are not slowed. Machines spanning the border of two groups (or a group and normal chunks) can get out of sync.
+                The global execution-budget-ms is not used while virtual-time is on (it would split a group tick).
+                Only active when enabled is true, monitor-only is false and chunk-throttling is true.""",
+                """
+                虚拟区块时间 (实验性). 不再使用时间账户, 每个限速组拥有自己的时钟, 运行速度低于服务器 (类似仅对该区域生效的 /tick rate).
+                组只在部分服务器 Tick 中运行 (整组跳过一个 Tick, 不做部分执行), 组内计划方块刻的所有延迟按组自己的时间计算,
+                因此中继器, 红石火把, 侦测器等保持彼此同步, 只是整体变慢. 活塞方块事件随之减速 (无需 slow-pistons), 开启 slow-block-entities 时方块实体也会减速.
+                组的速度 = group-budget-ms / 每个已执行 Tick 的实测耗时, 且不低于 min-speed.
+                实体不会被减速. 跨越两个组 (或组与普通区块) 边界的机械可能失去同步.
+                启用 virtual-time 时不使用全局 execution-budget-ms (它会拆分组的 Tick).
+                仅在 enabled 为 true, monitor-only 为 false 且 chunk-throttling 为 true 时生效."""
+            )
+        );
+        double loadedMinSpeed = globalConfig.getDouble(basePath() + ".min-speed", minSpeed,
+            globalConfig.pickStringRegionBased(
+                "Lowest speed of a throttled group with virtual-time, as a fraction of normal speed (0.1 = at most 10 times slower). Range: [0.02, 1.0].",
+                "启用 virtual-time 时限速组的最低速度, 相对正常速度的比例 (0.1 = 最多慢 10 倍). 范围: [0.02, 1.0]."
+            )
+        );
+        minSpeed = Double.isFinite(loadedMinSpeed) ? Math.clamp(loadedMinSpeed, 0.02, 1.0) : 0.1;
+        double loadedCatchUp = globalConfig.getDouble(basePath() + ".catch-up-speed", catchUpSpeed,
+            globalConfig.pickStringRegionBased(
+                """
+                With virtual-time, chunks that left a throttled group are behind real time. Their clock runs at this multiple of normal speed until they have caught up
+                (1.0 = never catch up, they keep the delay). Higher values catch up faster but speed machines up for a moment. Range: [1.0, 4.0].""",
+                """
+                启用 virtual-time 时, 离开限速组的区块落后于真实时间. 其时钟以该倍速运行直到追上 (1.0 = 不追赶, 保留延迟).
+                数值越高追赶越快, 但机械会短暂加速. 范围: [1.0, 4.0]."""
+            )
+        );
+        catchUpSpeed = Double.isFinite(loadedCatchUp) ? Math.clamp(loadedCatchUp, 1.0, 4.0) : 1.5;
+        slowBlockEntities = globalConfig.getBoolean(basePath() + ".slow-block-entities", slowBlockEntities,
+            globalConfig.pickStringRegionBased(
+                "With virtual-time, block entities (pistons in motion, hoppers, furnaces, ...) of a throttled group also only tick on the group's ticks.",
+                "启用 virtual-time 时, 限速组内的方块实体 (移动中的活塞, 漏斗, 熔炉等) 也只在该组运行的 Tick 中执行."
+            )
+        );
+        virtualLookahead = globalConfig.getBoolean(basePath() + ".virtual-lookahead", virtualLookahead,
+            globalConfig.pickStringRegionBased(
+                """
+                With virtual-time, every active chunk of a throttled group also pulls its 8 neighbours into the group, even if they are idle (limited by max-group-chunks).
+                This lowers the risk that a clock border runs through a moving machine (flying machine) when it crosses into the next chunk. It is no guarantee.
+                Requires propagate-active-chunks to be true, otherwise it has no effect.
+                The price: the group gets larger, and other redstone next to the machine is slowed as well. Moved pistons keep the chunks they touch in the group either way.""",
+                """
+                启用 virtual-time 时, 限速组内每个活跃区块会把其 8 个相邻区块一并拉入该组, 即使它们空闲 (受 max-group-chunks 限制).
+                这会降低移动的机器 (飞行机器) 进入下一个区块时时钟边界穿过机器的风险, 但不能保证.
+                需要 propagate-active-chunks 为 true, 否则不起作用.
+                代价: 组变大, 机器附近的其他红石也会被减速. 被活塞移动触及的区块无论如何都会留在组内."""
             )
         );
 

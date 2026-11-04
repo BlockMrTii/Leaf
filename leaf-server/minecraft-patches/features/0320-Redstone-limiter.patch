@@ -15,7 +15,7 @@ Adds the hooks of the redstone limiter to the scheduled tick scheduler:
 Everything stays vanilla while the limiter is disabled.
 
 diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
-index 54a4876d09bf4777e9ee55ae31429e6cd09a4140..ccbd60821bb23215a67bac94c09bac195be02697 100644
+index 54a4876d09bf4777e9ee55ae31429e6cd09a4140..0eb9915e5d5223659a2f790d4e6819952fd82dc0 100644
 --- a/net/minecraft/server/level/ServerLevel.java
 +++ b/net/minecraft/server/level/ServerLevel.java
 @@ -214,6 +214,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
@@ -26,26 +26,37 @@ index 54a4876d09bf4777e9ee55ae31429e6cd09a4140..ccbd60821bb23215a67bac94c09bac19
      private boolean handlingTick;
      private final List<CustomSpawner> customSpawners;
      private @Nullable EnderDragonFight dragonFight;
-@@ -701,6 +702,10 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+@@ -701,6 +702,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
          this.server = server;
          this.customSpawners = new ArrayList<>(); // Purpur - Allow toggling special MobSpawners per world
          this.serverLevelData = levelData;
 +        // Leaf start - Redstone limiter - only scheduled block ticks are gated, fluid ticks are untouched
 +        this.redstoneLimiter = new org.dreeam.leaf.world.redstone.RedstoneLimiterManager(this.bukkitName);
 +        this.blockTicks.setRedstoneLimiter(this.redstoneLimiter);
++        this.redstoneBlockEntityLimiter = this.redstoneLimiter; // Leaf - Redstone limiter - virtual time
 +        // Leaf end - Redstone limiter
          // Purpur start - Allow toggling special MobSpawners per world
          if (purpurConfig.phantomSpawning) {
              this.customSpawners.add(new net.minecraft.world.level.levelgen.PhantomSpawner());
-@@ -1088,6 +1093,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
-         profiler.popPush("blockEvents");
+@@ -1023,6 +1029,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         TickRateManager tickRateManager = this.tickRateManager();
+         boolean runs = tickRateManager.runsNormally();
          if (runs) {
-             this.runBlockEvents();
-+            this.redstoneLimiter.endTick(this.getGameTime()); // Leaf - Redstone limiter
-         }
++            this.redstoneLimiter.beginTick(); // Leaf - Redstone limiter - virtual time, decide which groups run in this tick before anything schedules ticks
+             profiler.push("world border");
+             this.getWorldBorder().tick();
+             profiler.popPush("weather");
+@@ -1177,6 +1184,9 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         this.chunkSource.randomState().garbageCollect();
+         if (org.dreeam.leaf.config.modules.opt.DespawnTime.proactiveWeakLoading) this.moonrise$getEntityLookup().leaf$tickWeakEntities(); // Leaf - Rewrite entity despawn time
+         if (org.dreeam.leaf.config.modules.async.MultithreadedTracker.enabled) { this.leaf$asyncTracker.onEntitiesTickEnd(); } // Leaf - Multithreaded tracker
++        if (runs) {
++            this.redstoneLimiter.endTick(this.getGameTime()); // Leaf - Redstone limiter - after block entities, so the groups do not change within a tick
++        }
+     }
  
-         this.handlingTick = false;
-@@ -1682,7 +1688,19 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     @Override
+@@ -1682,7 +1692,19 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
      private void tickBlock(final BlockPos pos, final Block type) {
          BlockState state = this.getBlockState(pos);
          if (state.is(type)) {
@@ -66,11 +77,11 @@ index 54a4876d09bf4777e9ee55ae31429e6cd09a4140..ccbd60821bb23215a67bac94c09bac19
          }
          // Paper start - rewrite chunk system
          // Leaf start - SparklyPaper - parallel world ticking (only run mid-tick at the end of each tick / fixes concurrency bugs related to executeMidTickTasks)
-@@ -2373,11 +2391,21 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+@@ -2373,11 +2395,21 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
  
      private void runBlockEvents() {
          this.blockEventsToReschedule.clear();
-+        final boolean limiterActive = org.dreeam.leaf.config.modules.opt.RedstoneLimiter.enabled && org.dreeam.leaf.config.modules.opt.RedstoneLimiter.slowPistons
++        final boolean limiterActive = org.dreeam.leaf.config.modules.opt.RedstoneLimiter.enabled && (org.dreeam.leaf.config.modules.opt.RedstoneLimiter.slowPistons || org.dreeam.leaf.config.modules.opt.RedstoneLimiter.virtualTime)
 +            && (org.dreeam.leaf.config.modules.opt.RedstoneLimiter.chunkThrottling || org.dreeam.leaf.config.modules.opt.RedstoneLimiter.monitorOnly); // Leaf - Redstone limiter - slow-pistons needs the group accounting
 +        final long limiterGameTime = limiterActive ? this.getGameTime() : 0L; // Leaf - Redstone limiter
  
@@ -89,7 +100,7 @@ index 54a4876d09bf4777e9ee55ae31429e6cd09a4140..ccbd60821bb23215a67bac94c09bac19
                      this.server
                          .getPlayerList()
                          .broadcast(
-@@ -2399,6 +2427,21 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+@@ -2399,6 +2431,21 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
          this.blockEvents.addAll(this.blockEventsToReschedule);
      }
  
@@ -111,8 +122,110 @@ index 54a4876d09bf4777e9ee55ae31429e6cd09a4140..ccbd60821bb23215a67bac94c09bac19
      private boolean doBlockEvent(final BlockEventData eventData) {
          BlockState state = this.getBlockState(eventData.pos());
          return state.is(eventData.block()) && state.triggerEvent(this, eventData.pos(), eventData.paramA(), eventData.paramB());
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index 5324975538dc94868a381b1c381c88faa40631b1..d34621aa113d41ef5772f594dbf804610d53396b 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -121,6 +121,7 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+     protected final CollectingNeighborUpdater neighborUpdater;
+     private final List<TickingBlockEntity> pendingBlockEntityTickers = Lists.newArrayList();
+     private boolean tickingBlockEntities;
++    public org.dreeam.leaf.world.redstone.RedstoneLimiterManager redstoneBlockEntityLimiter; // Leaf - Redstone limiter - virtual time
+     protected final Thread thread;
+     private final boolean isDebug;
+     private int skyDarken;
+@@ -1594,6 +1595,8 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+         boolean tickBlockEntities = this.tickRateManager().runsNormally();
+ 
+         int tickedEntities = 0; // Paper - rewrite chunk system
++        final org.dreeam.leaf.world.redstone.RedstoneLimiterManager beLimiter = this.redstoneBlockEntityLimiter; // Leaf - Redstone limiter - virtual time
++        final boolean skipBlockEntities = beLimiter != null && beLimiter.isSkippingChunks(); // Leaf - Redstone limiter - virtual time
+         // Paper start - Fix MC-117075 use removeAll
+         for (int tickerIndex = 0; tickerIndex < this.blockEntityTickers.size(); tickerIndex++) {
+             final TickingBlockEntity ticker = this.blockEntityTickers.get(tickerIndex);
+@@ -1601,6 +1604,9 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+             if (ticker.isRemoved()) {
+                 ((org.dreeam.leaf.util.list.BlockEntityTickersList) this.blockEntityTickers).markAsRemoved(tickerIndex); // Paper - Fix MC-117075; use removeAll // SparklyPaper - optimize block entity removals
+             } else if (tickBlockEntities /*&& this.shouldTickBlocksAt(ticker.getPos())*/) { // Leaf - remove shouldTickBlocksAt check - duplicate at BoundTickingBlockEntity#tick
++                if (skipBlockEntities && beLimiter.skipsBlockEntity(ticker.getPos())) { // Leaf - Redstone limiter - virtual time, the group's clock stands still this tick
++                    continue;
++                }
+                 ticker.tick();
+                 // Paper start - rewrite chunk system
+                 // Leaf start - SparklyPaper - parallel world ticking (only run mid-tick at the end of each tick / fixes concurrency bugs related to executeMidTickTasks)
+diff --git a/net/minecraft/world/level/block/piston/PistonBaseBlock.java b/net/minecraft/world/level/block/piston/PistonBaseBlock.java
+index 954dc301346863fc1d421f6f96660a6de55f17e7..0bff88fa6a4ef0597b7467ccbe1000b1f813042f 100644
+--- a/net/minecraft/world/level/block/piston/PistonBaseBlock.java
++++ b/net/minecraft/world/level/block/piston/PistonBaseBlock.java
+@@ -295,6 +295,25 @@ public class PistonBaseBlock extends DirectionalBlock {
+             return false;
+         }
+ 
++        // Leaf start - Redstone limiter - virtual time: a moved structure must not run in two different clocks
++        final org.dreeam.leaf.world.redstone.RedstoneLimiterManager limiter = level.redstoneBlockEntityLimiter;
++        if (limiter != null && limiter.couplesChunks()) {
++            final long pistonChunk = net.minecraft.world.level.ChunkPos.pack(pistonPos);
++            final Direction moveDirection = extending ? direction : direction.getOpposite();
++            final long armChunk = net.minecraft.world.level.ChunkPos.pack(armPos);
++            for (int pass = 0; pass < 2; ++pass) { // the second pass: the piston's chunk may have joined a group during the first one
++                limiter.coupleChunks(pistonChunk, armChunk);
++                for (BlockPos pushed : resolver.getToPush()) {
++                    limiter.coupleChunks(pistonChunk, net.minecraft.world.level.ChunkPos.pack(pushed));
++                    limiter.coupleChunks(pistonChunk, net.minecraft.world.level.ChunkPos.pack(pushed.relative(moveDirection)));
++                }
++                for (BlockPos destroyed : resolver.getToDestroy()) {
++                    limiter.coupleChunks(pistonChunk, net.minecraft.world.level.ChunkPos.pack(destroyed));
++                }
++            }
++        }
++        // Leaf end - Redstone limiter
++
+         Map<BlockPos, BlockState> deleteAfterMove = Maps.newHashMap();
+         List<BlockPos> toPush = resolver.getToPush();
+         List<BlockState> toPushShapes = Lists.newArrayList();
+diff --git a/net/minecraft/world/level/chunk/storage/SerializableChunkData.java b/net/minecraft/world/level/chunk/storage/SerializableChunkData.java
+index 6d453411faa989785325caf8c259da7e52dbe3eb..c6a0da80eef4b53b69a7bd58919dd0279be89d7a 100644
+--- a/net/minecraft/world/level/chunk/storage/SerializableChunkData.java
++++ b/net/minecraft/world/level/chunk/storage/SerializableChunkData.java
+@@ -543,7 +543,13 @@ public record SerializableChunkData(
+             heightmaps.put(entry.getKey(), Arrays.copyOf(data, data.length)); // Leaf - Optimize chunkUnload
+         }
+ 
+-        ChunkAccess.PackedTicks ticksForSerialization = chunk.getTicksForSerialization(level.getGameTime());
++        // Leaf start - Redstone limiter - virtual time: ticks of a slowed chunk are stored relative to its own clock (server time minus lag), so the remaining time survives a save
++        long serializationTime = level.getGameTime();
++        if (chunk instanceof net.minecraft.world.level.chunk.LevelChunk && level.redstoneBlockEntityLimiter != null && level.redstoneBlockEntityLimiter.hasLag()) {
++            serializationTime -= level.redstoneBlockEntityLimiter.lagOf(chunk.getPos().pack());
++        }
++        ChunkAccess.PackedTicks ticksForSerialization = chunk.getTicksForSerialization(serializationTime);
++        // Leaf end - Redstone limiter
+         // Leaf start - Optimize chunkUnload - remove stream
+         ShortList[] postProcessing = chunk.getPostProcessing();
+         ShortList[] postProcessingSections = new ShortList[postProcessing.length];
+diff --git a/net/minecraft/world/ticks/LevelChunkTicks.java b/net/minecraft/world/ticks/LevelChunkTicks.java
+index 88eb48034d8022600dc08b4dcf6162bbdd8c6d33..afcaed31c069e3257ec10a1ca0d128b2eed8c769 100644
+--- a/net/minecraft/world/ticks/LevelChunkTicks.java
++++ b/net/minecraft/world/ticks/LevelChunkTicks.java
+@@ -60,6 +60,17 @@ public class LevelChunkTicks<T> implements TickContainerAccess<T>, SerializableT
+         this.onTickAdded = onTickAdded;
+     }
+ 
++    // Leaf start - Redstone limiter - virtual time: moves all pending ticks of the container in time
++    public void shiftTriggerTicks(final long delta) {
++        final List<ScheduledTick<T>> all = new ArrayList<>(this.tickQueue);
++        this.tickQueue.clear();
++        for (final ScheduledTick<T> tick : all) {
++            this.tickQueue.add(new ScheduledTick<>(tick.type(), tick.pos(), tick.triggerTick() + delta, tick.priority(), tick.subTickOrder()));
++        }
++        this.dirty = true;
++    }
++    // Leaf end - Redstone limiter
++
+     public @Nullable ScheduledTick<T> peek() {
+         return this.tickQueue.peek();
+     }
 diff --git a/net/minecraft/world/ticks/LevelTicks.java b/net/minecraft/world/ticks/LevelTicks.java
-index 7bf9e93692debcef511bfa316aeef32ae8a7d3b7..6eb2576f8c7a530b76554bbd58df54c03b55eb41 100644
+index 7bf9e93692debcef511bfa316aeef32ae8a7d3b7..75f09feb01232eb340321304523e268f8a82bf62 100644
 --- a/net/minecraft/world/ticks/LevelTicks.java
 +++ b/net/minecraft/world/ticks/LevelTicks.java
 @@ -33,7 +33,7 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
@@ -124,7 +237,7 @@ index 7bf9e93692debcef511bfa316aeef32ae8a7d3b7..6eb2576f8c7a530b76554bbd58df54c0
      private final Queue<ScheduledTick<T>> toRunThisTick = new ArrayDeque<>();
      private final List<ScheduledTick<T>> alreadyRunThisTick = new ArrayList<>();
      private final Set<ScheduledTick<?>> toRunThisTickSet = new ObjectOpenCustomHashSet<>(ScheduledTick.UNIQUE_TICK_HASH);
-@@ -43,10 +43,37 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+@@ -43,10 +43,67 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
          }
      };
  
@@ -139,13 +252,43 @@ index 7bf9e93692debcef511bfa316aeef32ae8a7d3b7..6eb2576f8c7a530b76554bbd58df54c0
 +    private long orderTick;
 +
 +    private int compareBacklogFirst(final ScheduledTick<?> o1, final ScheduledTick<?> o2) {
-+        final boolean overdue1 = o1.triggerTick() < this.orderTick;
-+        final boolean overdue2 = o2.triggerTick() < this.orderTick;
++        // virtual time: trigger ticks are in the clock of their chunk, compare them on the server clock
++        final long t1 = this.serverTrigger(o1);
++        final long t2 = this.serverTrigger(o2);
++        final boolean overdue1 = t1 < this.orderTick;
++        final boolean overdue2 = t2 < this.orderTick;
 +        if (overdue1 != overdue2) {
 +            return overdue1 ? -1 : 1;
 +        }
-+        // among overdue ticks the oldest trigger tick goes first, fresh ticks keep the vanilla order
-+        return overdue1 ? ScheduledTick.DRAIN_ORDER.compare(o1, o2) : ScheduledTick.INTRA_TICK_DRAIN_ORDER.compare(o1, o2);
++        if (overdue1) {
++            // among overdue ticks the oldest trigger tick goes first
++            final int compare = Long.compare(t1, t2);
++            return compare != 0 ? compare : ScheduledTick.INTRA_TICK_DRAIN_ORDER.compare(o1, o2);
++        }
++        // fresh ticks keep the vanilla order
++        return ScheduledTick.INTRA_TICK_DRAIN_ORDER.compare(o1, o2);
++    }
++
++    private long serverTrigger(final ScheduledTick<?> tick) {
++        return this.redstoneLimiter != null && this.redstoneLimiter.hasLag() ? tick.triggerTick() + this.redstoneLimiter.lagOf(ChunkPos.pack(tick.pos())) : tick.triggerTick();
++    }
++
++    // moves the pending ticks of chunks whose lag changed (a chunk joined or merged into a group) so their remaining time stays the same
++    private void applyTriggerShifts() {
++        final it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap shifts = this.redstoneLimiter.takeShifts();
++        if (shifts == null) {
++            return;
++        }
++        for (final it.unimi.dsi.fastutil.longs.Long2LongMap.Entry shift : shifts.long2LongEntrySet()) {
++            final LevelChunkTicks<T> container = this.allContainers.get(shift.getLongKey());
++            if (container != null) {
++                container.shiftTriggerTicks(shift.getLongValue());
++                final ScheduledTick<T> top = container.peek();
++                if (top != null) {
++                    this.nextTickForContainer.put(shift.getLongKey(), top.triggerTick());
++                }
++            }
++        }
 +    }
 +    // Leaf end - Redstone limiter
 +
@@ -162,7 +305,19 @@ index 7bf9e93692debcef511bfa316aeef32ae8a7d3b7..6eb2576f8c7a530b76554bbd58df54c0
      public void addContainer(final ChunkPos pos, final LevelChunkTicks<T> container) {
          long posKey = pos.pack();
          this.allContainers.put(posKey, container);
-@@ -65,6 +92,11 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+@@ -56,6 +113,11 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+         }
+ 
+         container.setOnTickAdded(this.chunkScheduleUpdater);
++        // Leaf start - Redstone limiter - virtual time: a loaded chunk starts in the server clock
++        if (this.redstoneLimiter != null) {
++            this.redstoneLimiter.onChunkLoaded(posKey);
++        }
++        // Leaf end - Redstone limiter
+     }
+ 
+     public void removeContainer(final ChunkPos pos) {
+@@ -65,6 +127,11 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
          if (removedContainer != null) {
              removedContainer.setOnTickAdded(null);
          }
@@ -174,8 +329,33 @@ index 7bf9e93692debcef511bfa316aeef32ae8a7d3b7..6eb2576f8c7a530b76554bbd58df54c0
      }
  
      @Override
-@@ -80,11 +112,22 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+@@ -74,17 +141,49 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+         if (tickContainer == null) {
+             Util.logAndPauseIfInIde("Trying to schedule tick in not loaded position " + tick.pos());
+         } else {
+-            tickContainer.schedule(tick);
++            // Leaf start - Redstone limiter - virtual time: the delay of a tick is counted in the clock of its chunk
++            ScheduledTick<T> scheduled = tick;
++            if (this.redstoneLimiter != null && this.redstoneLimiter.hasPendingShifts()) {
++                this.applyTriggerShifts();
++            }
++            if (this.redstoneLimiter != null && this.redstoneLimiter.hasLag()) {
++                final long lag = this.redstoneLimiter.lagOf(chunkKey);
++                if (lag > 0L) {
++                    scheduled = new ScheduledTick<>(tick.type(), tick.pos(), tick.triggerTick() - lag, tick.priority(), tick.subTickOrder());
++                }
++            }
++            // Leaf end - Redstone limiter
++            tickContainer.schedule(scheduled);
+         }
+     }
  
++    // Leaf start - Redstone limiter - virtual time: the server tick as seen by the clock of a chunk (server tick minus its lag)
++    private long effectiveTick(final long chunkKey, final long currentTick) {
++        return this.redstoneLimiter != null && this.redstoneLimiter.hasLag() ? currentTick - this.redstoneLimiter.lagOf(chunkKey) : currentTick;
++    }
++    // Leaf end - Redstone limiter
++
      public void tick(final long currentTick, final int maxTicksToProcess, final BiConsumer<BlockPos, T> output) {
          ProfilerFiller profiler = Profiler.get();
 +        // Leaf start - Redstone limiter - hard time budget for this phase, 0 means vanilla behaviour
@@ -184,6 +364,9 @@ index 7bf9e93692debcef511bfa316aeef32ae8a7d3b7..6eb2576f8c7a530b76554bbd58df54c0
 +        if (budgetNanos > 0L) {
 +            // only collect about what fits into the budget, the rest stays in the chunk containers (vanilla leftover handling)
 +            collectLimit = (int) Math.min(maxTicksToProcess, Math.max(32L, (long) (budgetNanos / this.avgTickNanos * 1.25D)));
++        }
++        if (this.redstoneLimiter != null && this.redstoneLimiter.hasPendingShifts()) {
++            this.applyTriggerShifts();
 +        }
 +        this.localThrottling = this.redstoneLimiter != null && this.redstoneLimiter.isLocalActive();
 +        this.backlogFirst = budgetNanos > 0L || this.localThrottling;
@@ -199,14 +382,35 @@ index 7bf9e93692debcef511bfa316aeef32ae8a7d3b7..6eb2576f8c7a530b76554bbd58df54c0
          profiler.popPush("cleanup");
          this.cleanupAfterTick();
          profiler.pop();
-@@ -126,12 +169,21 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+@@ -104,7 +203,8 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+             Entry entry = it.next();
+             long chunkPos = entry.getLongKey();
+             long nextTick = entry.getLongValue();
+-            if (nextTick <= currentTick) {
++            final long chunkTick = this.effectiveTick(chunkPos, currentTick); // Leaf - Redstone limiter - virtual time
++            if (nextTick <= chunkTick) {
+                 LevelChunkTicks<T> candidateContainer = this.allContainers.get(chunkPos);
+                 if (candidateContainer == null) {
+                     it.remove();
+@@ -112,7 +212,7 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+                     ScheduledTick<T> scheduledTick = candidateContainer.peek();
+                     if (scheduledTick == null) {
+                         it.remove();
+-                    } else if (scheduledTick.triggerTick() > currentTick) {
++                    } else if (scheduledTick.triggerTick() > chunkTick) {
+                         entry.setValue(scheduledTick.triggerTick());
+                     } else if (this.tickCheck.test(chunkPos)) {
+                         it.remove();
+@@ -126,12 +226,23 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
      private void drainContainers(final long currentTick, final int maxTicksToProcess) {
          LevelChunkTicks<T> topContainer;
          while (this.canScheduleMoreTicks(maxTicksToProcess) && (topContainer = this.containersToTick.poll()) != null) {
 +            // Leaf start - Redstone limiter - local throttling: a group whose time account is used up gets no more ticks admitted this
 +            // server tick. The ticks stay untouched in the container (nothing is polled, so nothing is lost or merged) and the
 +            // container is retried next tick.
-+            if (this.localThrottling && !this.redstoneLimiter.admitScheduledTick(ChunkPos.pack(topContainer.peek().pos()), currentTick)) {
++            final long containerKey = ChunkPos.pack(topContainer.peek().pos());
++            final long chunkTick = this.effectiveTick(containerKey, currentTick);
++            if (this.localThrottling && !this.redstoneLimiter.admitScheduledTick(containerKey, currentTick)) {
 +                this.updateContainerScheduling(topContainer.peek());
 +                continue;
 +            }
@@ -214,19 +418,31 @@ index 7bf9e93692debcef511bfa316aeef32ae8a7d3b7..6eb2576f8c7a530b76554bbd58df54c0
 +            this.admissionRejected = false; // Leaf - Redstone limiter
              ScheduledTick<T> tick = topContainer.poll();
              this.scheduleForThisTick(tick);
-             this.drainFromCurrentContainer(this.containersToTick, topContainer, currentTick, maxTicksToProcess);
+-            this.drainFromCurrentContainer(this.containersToTick, topContainer, currentTick, maxTicksToProcess);
++            this.drainFromCurrentContainer(this.containersToTick, topContainer, currentTick, chunkTick, maxTicksToProcess); // Leaf - Redstone limiter - virtual time
              ScheduledTick<T> nextTick = topContainer.peek();
              if (nextTick != null) {
 -                if (nextTick.triggerTick() <= currentTick && this.canScheduleMoreTicks(maxTicksToProcess)) {
-+                if (!this.admissionRejected && nextTick.triggerTick() <= currentTick && this.canScheduleMoreTicks(maxTicksToProcess)) { // Leaf - Redstone limiter - a container held back by the limiter is not queued again
++                if (!this.admissionRejected && nextTick.triggerTick() <= chunkTick && this.canScheduleMoreTicks(maxTicksToProcess)) { // Leaf - Redstone limiter - a container held back by the limiter is not queued again
                      this.containersToTick.add(topContainer);
                  } else {
                      this.updateContainerScheduling(nextTick);
-@@ -161,9 +213,17 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+@@ -151,7 +262,7 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+     }
+ 
+     private void drainFromCurrentContainer(
+-        final Queue<LevelChunkTicks<T>> containersToTick, final LevelChunkTicks<T> currentContainer, final long currentTick, final int maxTicksToProcess
++        final Queue<LevelChunkTicks<T>> containersToTick, final LevelChunkTicks<T> currentContainer, final long currentTick, final long chunkTick, final int maxTicksToProcess // Leaf - Redstone limiter - virtual time
+     ) {
+         if (this.canScheduleMoreTicks(maxTicksToProcess)) {
+             LevelChunkTicks<T> nextBestContainer = containersToTick.peek();
+@@ -160,10 +271,18 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+             while (this.canScheduleMoreTicks(maxTicksToProcess)) {
                  ScheduledTick<T> nextFromCurrentContainer = currentContainer.peek();
                  if (nextFromCurrentContainer == null
-                     || nextFromCurrentContainer.triggerTick() > currentTick
+-                    || nextFromCurrentContainer.triggerTick() > currentTick
 -                    || nextFromNextContainer != null && ScheduledTick.INTRA_TICK_DRAIN_ORDER.compare(nextFromCurrentContainer, nextFromNextContainer) > 0) {
++                    || nextFromCurrentContainer.triggerTick() > chunkTick // Leaf - Redstone limiter - virtual time
 +                    || nextFromNextContainer != null && (this.backlogFirst // Leaf - Redstone limiter
 +                        ? this.compareBacklogFirst(nextFromCurrentContainer, nextFromNextContainer)
 +                        : ScheduledTick.INTRA_TICK_DRAIN_ORDER.compare(nextFromCurrentContainer, nextFromNextContainer)) > 0) {
@@ -241,7 +457,7 @@ index 7bf9e93692debcef511bfa316aeef32ae8a7d3b7..6eb2576f8c7a530b76554bbd58df54c0
  
                  currentContainer.poll();
                  this.scheduleForThisTick(nextFromCurrentContainer);
-@@ -179,7 +239,13 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+@@ -179,7 +298,13 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
          return this.toRunThisTick.size() < maxTicksToProcess;
      }
  
@@ -256,7 +472,7 @@ index 7bf9e93692debcef511bfa316aeef32ae8a7d3b7..6eb2576f8c7a530b76554bbd58df54c0
          while (!this.toRunThisTick.isEmpty()) {
              ScheduledTick<T> entry = this.toRunThisTick.poll();
              if (!this.toRunThisTickSet.isEmpty()) {
-@@ -191,6 +257,65 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+@@ -191,6 +316,65 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
          }
      }
  
@@ -322,3 +538,35 @@ index 7bf9e93692debcef511bfa316aeef32ae8a7d3b7..6eb2576f8c7a530b76554bbd58df54c0
      private void cleanupAfterTick() {
          this.toRunThisTick.clear();
          this.containersToTick.clear();
+@@ -256,11 +440,31 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+     }
+ 
+     public void copyAreaFrom(final LevelTicks<T> source, final BoundingBox area, final Vec3i offset) {
++        // Leaf start - Redstone limiter - virtual time: pending shifts must be applied before ticks are read from the containers
++        if (source.redstoneLimiter != null && source.redstoneLimiter.hasPendingShifts()) {
++            source.applyTriggerShifts();
++        }
++        if (source != this && this.redstoneLimiter != null && this.redstoneLimiter.hasPendingShifts()) {
++            this.applyTriggerShifts();
++        }
++        // Leaf end - Redstone limiter
+         List<ScheduledTick<T>> ticksToAdd = new ArrayList<>();
+         Predicate<ScheduledTick<T>> tickInsideBB = t -> area.isInside(t.pos());
+         source.alreadyRunThisTick.stream().filter(tickInsideBB).forEach(ticksToAdd::add);
+         source.toRunThisTick.stream().filter(tickInsideBB).forEach(ticksToAdd::add);
+         source.forContainersInArea(area, (pos, container) -> container.getAll().filter(tickInsideBB).forEach(ticksToAdd::add));
++        // Leaf start - Redstone limiter - virtual time: bring the copied ticks from the clock of their source chunk to the server clock,
++        // schedule() converts them into the clock of the target chunk
++        if (source.redstoneLimiter != null && source.redstoneLimiter.hasLag()) {
++            for (int i = 0; i < ticksToAdd.size(); ++i) {
++                final ScheduledTick<T> sourceTick = ticksToAdd.get(i);
++                final long lag = source.redstoneLimiter.lagOf(ChunkPos.pack(sourceTick.pos()));
++                if (lag != 0L) {
++                    ticksToAdd.set(i, new ScheduledTick<>(sourceTick.type(), sourceTick.pos(), sourceTick.triggerTick() + lag, sourceTick.priority(), sourceTick.subTickOrder()));
++                }
++            }
++        }
++        // Leaf end - Redstone limiter
+         LongSummaryStatistics info = ticksToAdd.stream().mapToLong(ScheduledTick::subTickOrder).summaryStatistics();
+         long minSubTick = info.getMin();
+         long maxSubTick = info.getMax();
