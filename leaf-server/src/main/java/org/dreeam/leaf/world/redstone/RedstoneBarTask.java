@@ -2,12 +2,17 @@ package org.dreeam.leaf.world.redstone;
 
 import net.kyori.adventure.bossbar.BossBar;
 import net.kyori.adventure.text.Component;
-import net.kyori.adventure.text.TextComponent;
 import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.format.TextColor;
 import org.bukkit.Bukkit;
+import org.bukkit.NamespacedKey;
 import org.bukkit.entity.Player;
+import org.bukkit.persistence.PersistentDataContainer;
+import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.scheduler.BukkitTask;
+import org.dreeam.leaf.command.subcommands.RedstoneBarCommand;
 import org.dreeam.leaf.config.LeafConfig;
+import org.dreeam.leaf.config.modules.opt.RedstoneLimiter;
 import org.jspecify.annotations.Nullable;
 import org.purpurmc.purpur.util.MinecraftInternalPlugin;
 
@@ -20,77 +25,124 @@ import java.util.UUID;
 /**
  * Shows the redstone load of a player's world in a boss bar (like Purpur's tpsbar).
  * <p>
- * Everything here runs on the main thread: the command toggles the bar there and the update task is a synchronous
- * scheduler task, so there is no concurrent access to the bars and no locking is needed. The numbers come from
- * {@link RedstoneLimiterManager#stats()}, an immutable snapshot published by the world's tick thread.
+ * Like Purpur's tpsbar, whether a player has the bar on is saved in the player's own data (the player's NBT, here through
+ * the persistent data container), so it survives reconnects and restarts and needs no extra file. Purpur re-adds the bar
+ * from a join hook; here a single synchronous scheduler task (started by the first world tick or the first command) shows the
+ * bar to online players with the flag and updates it, so everything touching the bars runs on the main thread. The numbers
+ * come from {@link RedstoneLimiterManager#stats()}, an immutable snapshot published by the world's tick thread.
  */
 public final class RedstoneBarTask {
 
     private static final long UPDATE_INTERVAL_TICKS = 10L;
+    private static final double FALLBACK_MAX_MS = 50.0;
+    private static final double CHUNKS_FOR_RED = 16.0;
+    private static final NamespacedKey FLAG = new NamespacedKey("leaf", "redstonebar");
+    private static final TextColor GREEN = NamedTextColor.GREEN;
+    private static final TextColor YELLOW = NamedTextColor.YELLOW;
+    private static final TextColor RED = NamedTextColor.RED;
+
     private static final Map<UUID, Viewer> VIEWERS = new HashMap<>();
+    private static volatile boolean started;
     private static @Nullable BukkitTask task;
 
     private RedstoneBarTask() {
     }
 
     /**
-     * Switches the bar of the player on or off and returns whether it is on now. Normally called on the main thread; it is
-     * synchronized because a plugin can dispatch the command from a world thread with parallel world ticking.
+     * Starts the update task once. Cheap after the first call, so it can be called every tick.
      */
-    public static synchronized boolean toggle(final Player player) {
-        final Viewer existing = VIEWERS.get(player.getUniqueId());
-        if (existing != null && existing.player == player) {
-            VIEWERS.remove(player.getUniqueId());
-            player.hideBossBar(existing.bar);
-            stopIfUnused();
-            return false;
+    public static void ensureStarted() {
+        if (started) {
+            return;
         }
-        // No bar yet, or the entry belongs to an earlier connection of the same player (quick reconnect): start a fresh bar
-        VIEWERS.remove(player.getUniqueId());
+        synchronized (RedstoneBarTask.class) {
+            if (started) {
+                return;
+            }
+            try {
+                task = Bukkit.getScheduler().runTaskTimer(new MinecraftInternalPlugin(), RedstoneBarTask::tick, UPDATE_INTERVAL_TICKS, UPDATE_INTERVAL_TICKS);
+                started = true;
+            } catch (RuntimeException e) {
+                LeafConfig.LOGGER.warn("Failed to start the redstone bar task", e);
+            }
+        }
+    }
 
-        final BossBar bar = BossBar.bossBar(Component.empty(), 0.0f, BossBar.Color.WHITE, BossBar.Overlay.PROGRESS);
+    private static boolean hasFlag(final Player player) {
+        return player.getPersistentDataContainer().getOrDefault(FLAG, PersistentDataType.BOOLEAN, false);
+    }
+
+    /**
+     * Switches the bar of the player on or off (saved in the player data) and returns whether it is on now.
+     */
+    public static boolean toggle(final Player player) {
+        ensureStarted();
+        synchronized (RedstoneBarTask.class) {
+            final PersistentDataContainer data = player.getPersistentDataContainer();
+            if (hasFlag(player)) {
+                data.remove(FLAG);
+                hide(player.getUniqueId());
+                return false;
+            }
+            data.set(FLAG, PersistentDataType.BOOLEAN, true);
+            show(player);
+            return true;
+        }
+    }
+
+    private static void tick() {
+        synchronized (RedstoneBarTask.class) {
+            // Drop bars of players who left, reconnected with a new player object, switched it off or lost the permission
+            final Iterator<Map.Entry<UUID, Viewer>> iterator = VIEWERS.entrySet().iterator();
+            while (iterator.hasNext()) {
+                final Viewer viewer = iterator.next().getValue();
+                final Player current = Bukkit.getPlayer(viewer.player.getUniqueId());
+                if (current != viewer.player || !hasFlag(current) || !current.hasPermission(RedstoneBarCommand.PERM)) {
+                    iterator.remove();
+                    if (current != null) {
+                        current.hideBossBar(viewer.bar);
+                    }
+                }
+            }
+
+            // Show the bar to online players who have it on but do not see it yet (e.g. after joining)
+            for (final Player player : Bukkit.getOnlinePlayers()) {
+                if (!VIEWERS.containsKey(player.getUniqueId()) && hasFlag(player) && player.hasPermission(RedstoneBarCommand.PERM)) {
+                    show(player);
+                }
+            }
+
+            final Iterator<Map.Entry<UUID, Viewer>> updates = VIEWERS.entrySet().iterator();
+            while (updates.hasNext()) {
+                final Viewer viewer = updates.next().getValue();
+                try {
+                    update(viewer);
+                } catch (RuntimeException e) {
+                    updates.remove();
+                    viewer.player.hideBossBar(viewer.bar);
+                    LeafConfig.LOGGER.warn("Failed to update the redstone bar of " + viewer.player.getName() + ", removing it", e);
+                }
+            }
+        }
+    }
+
+    private static void show(final Player player) {
+        hide(player.getUniqueId());
+        final BossBar bar = BossBar.bossBar(Component.empty(), 0.0f, BossBar.Color.GREEN, BossBar.Overlay.NOTCHED_20);
         final Viewer viewer = new Viewer(player, bar);
-        VIEWERS.put(player.getUniqueId(), viewer);
         try {
             update(viewer);
             player.showBossBar(bar);
-            if (task == null) {
-                task = Bukkit.getScheduler().runTaskTimer(new MinecraftInternalPlugin(), RedstoneBarTask::tick, UPDATE_INTERVAL_TICKS, UPDATE_INTERVAL_TICKS);
-            }
+            VIEWERS.put(player.getUniqueId(), viewer);
         } catch (RuntimeException e) {
-            VIEWERS.remove(player.getUniqueId());
-            stopIfUnused();
-            throw e;
+            LeafConfig.LOGGER.warn("Failed to show the redstone bar to " + player.getName(), e);
         }
-        return true;
     }
 
-    private static synchronized void tick() {
-        final Iterator<Map.Entry<UUID, Viewer>> iterator = VIEWERS.entrySet().iterator();
-        while (iterator.hasNext()) {
-            final Viewer viewer = iterator.next().getValue();
-            final Player current = Bukkit.getPlayer(viewer.player.getUniqueId());
-            // Logged out, or logged in again with a new player object: the old bar is gone with the old connection
-            if (current != viewer.player) {
-                iterator.remove();
-                continue;
-            }
-
-            try {
-                update(viewer);
-            } catch (RuntimeException e) {
-                iterator.remove();
-                current.hideBossBar(viewer.bar);
-                LeafConfig.LOGGER.warn("Failed to update the redstone bar of " + current.getName() + ", removing it", e);
-            }
-        }
-        stopIfUnused();
-    }
-
-    private static void stopIfUnused() {
-        if (VIEWERS.isEmpty() && task != null) {
-            task.cancel();
-            task = null;
+    private static void hide(final UUID id) {
+        final Viewer viewer = VIEWERS.remove(id);
+        if (viewer != null) {
+            viewer.player.hideBossBar(viewer.bar);
         }
     }
 
@@ -110,47 +162,34 @@ public final class RedstoneBarTask {
             return;
         }
 
+        // The bar ends at the configured limit: full bar = execution-budget-ms (50 ms if no limit is set)
+        final double maxMs = RedstoneLimiter.executionBudgetMs > 0.0 ? RedstoneLimiter.executionBudgetMs : FALLBACK_MAX_MS;
         final double redstoneMs = stats.redstoneMs();
-        NamedTextColor textColor;
-        BossBar.Color barColor;
+        final double ratio = Math.max(0.0, Math.min(1.0, redstoneMs / maxMs));
+        final int chunks = stats.throttledChunks();
 
-        if (redstoneMs < 5.0) {
-            textColor = NamedTextColor.GREEN;
-            barColor = BossBar.Color.GREEN;
-        } else if (redstoneMs < 15.0) {
-            textColor = NamedTextColor.YELLOW;
-            barColor = BossBar.Color.YELLOW;
-        } else {
-            textColor = NamedTextColor.RED;
-            barColor = BossBar.Color.RED;
-        }
+        final Component top = stats.hasHottest()
+            ? Component.text("[" + stats.hottestChunkX() + ", " + stats.hottestChunkZ() + "]", NamedTextColor.WHITE)
+            : Component.text("-", NamedTextColor.WHITE);
 
-        if (stats.throttledChunks() > 0 && barColor == BossBar.Color.GREEN) {
-            textColor = NamedTextColor.YELLOW;
-            barColor = BossBar.Color.YELLOW;
-        }
+        bossbar.name(Component.text()
+            .append(Component.text("MS: ", NamedTextColor.GRAY))
+            .append(Component.text(String.format(Locale.ROOT, "%.2f", redstoneMs), gradient(ratio)))
+            .append(Component.text(" CH: ", NamedTextColor.GRAY))
+            .append(Component.text(chunks, gradient(chunks / CHUNKS_FOR_RED)))
+            .append(Component.text(" TOP: ", NamedTextColor.GRAY))
+            .append(top)
+            .build());
+        bossbar.progress((float) ratio);
+        bossbar.color(ratio < 0.5 ? BossBar.Color.GREEN : ratio < 0.8 ? BossBar.Color.YELLOW : BossBar.Color.RED);
+    }
 
-        final double percent = (redstoneMs / 50.0) * 100.0;
-        final TextComponent.Builder title = Component.text()
-            .append(Component.text("Redstone: "))
-            .append(Component.text(String.format(Locale.ROOT, "%.2f", redstoneMs), textColor))
-            .append(Component.text(" ms (" + String.format(Locale.ROOT, "%.1f", percent) + "%)"))
-            .append(Component.text(" | hot: " + stats.hotChunks() + " | throttled: " + stats.throttledChunks() + " chunks"));
-
-        if (!stats.throttling() && stats.hotChunks() > 0) {
-            title.append(Component.text(" (monitor)", NamedTextColor.GRAY));
-        }
-
-        if (stats.hasHottest() && stats.hottestMs() > 0.05) {
-            title.append(Component.text(" | top [" + stats.hottestChunkX() + ", " + stats.hottestChunkZ() + "] "
-                + String.format(Locale.ROOT, "%.2f", stats.hottestMs()) + " ms"));
-        }
-
-        title.append(Component.text(" [" + worldName + "]"));
-
-        bossbar.name(title.build());
-        bossbar.progress((float) Math.max(0.0, Math.min(1.0, redstoneMs / 50.0)));
-        bossbar.color(barColor);
+    /**
+     * Green (0) over yellow (0.5) to red (1).
+     */
+    private static TextColor gradient(final double value) {
+        final float v = (float) Math.max(0.0, Math.min(1.0, value));
+        return v < 0.5f ? TextColor.lerp(v * 2.0f, GREEN, YELLOW) : TextColor.lerp((v - 0.5f) * 2.0f, YELLOW, RED);
     }
 
     private record Viewer(Player player, BossBar bar) {

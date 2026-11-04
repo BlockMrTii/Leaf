@@ -201,6 +201,7 @@ public final class RedstoneLimiterManager {
     }
 
     public void endTick(long gameTime) {
+        RedstoneBarTask.ensureStarted();
         this.currentTick = gameTime == Long.MAX_VALUE ? Long.MAX_VALUE : gameTime + 1;
         if (!RedstoneLimiter.enabled || (!RedstoneLimiter.chunkThrottling && !RedstoneLimiter.monitorOnly)) {
             this.clearTracking();
