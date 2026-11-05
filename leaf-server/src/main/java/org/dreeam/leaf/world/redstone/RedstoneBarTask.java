@@ -34,7 +34,6 @@ import java.util.UUID;
 public final class RedstoneBarTask {
 
     private static final long UPDATE_INTERVAL_TICKS = 10L;
-    private static final double FALLBACK_MAX_MS = 50.0;
     private static final double CHUNKS_FOR_RED = 16.0;
     private static final NamespacedKey FLAG = new NamespacedKey("leaf", "redstonebar");
     private static final TextColor GREEN = NamedTextColor.GREEN;
@@ -155,17 +154,18 @@ public final class RedstoneBarTask {
         if (stats == null || !stats.measuring()) {
             bossbar.name(Component.text()
                 .append(Component.text("Redstone is not measured in this world ", NamedTextColor.RED))
-                .append(Component.text("(performance.redstone-limiter: enabled and monitor-only or chunk-throttling)", NamedTextColor.GRAY))
+                .append(Component.text("(performance.redstone-limiter.enabled)", NamedTextColor.GRAY))
                 .build());
             bossbar.progress(0.0f);
             bossbar.color(BossBar.Color.WHITE);
             return;
         }
 
-        // The bar ends at the configured limit: full bar = execution-budget-ms (50 ms if no limit is set)
-        final double maxMs = RedstoneLimiter.executionBudgetMs > 0.0 ? RedstoneLimiter.executionBudgetMs : FALLBACK_MAX_MS;
-        final double redstoneMs = stats.redstoneMs();
-        final double ratio = Math.max(0.0, Math.min(1.0, redstoneMs / maxMs));
+        // The bar ends at the configured limit: full bar = mspt-threshold (the tick time at which the slowdown starts)
+        final double maxMs = RedstoneLimiter.msptThreshold; // clamped to [5, 1000] by the config
+        final double msptMs = stats.msptMs();
+        final double ratio = Math.max(0.0, Math.min(1.0, msptMs / maxMs));
+        final double slowdown = Math.max(0.0, Math.min(1.0, 1.0 - stats.speed()));
         final int chunks = stats.throttledChunks();
 
         final Component top = stats.hasHottest()
@@ -173,15 +173,20 @@ public final class RedstoneBarTask {
             : Component.text("-", NamedTextColor.WHITE);
 
         bossbar.name(Component.text()
-            .append(Component.text("MS: ", NamedTextColor.GRAY))
-            .append(Component.text(String.format(Locale.ROOT, "%.2f", redstoneMs), gradient(ratio)))
+            .append(Component.text("MSPT: ", NamedTextColor.GRAY))
+            .append(Component.text(String.format(Locale.ROOT, "%.1f", msptMs), gradient(ratio)))
+            .append(Component.text(" SPD: ", NamedTextColor.GRAY))
+            .append(Component.text(String.format(Locale.ROOT, "%.0f%%", stats.speed() * 100.0), gradient(slowdown)))
+            .append(Component.text(RedstoneLimiter.monitorOnly ? " (monitor)" : "", NamedTextColor.GRAY))
+            .append(Component.text(" RS: ", NamedTextColor.GRAY))
+            .append(Component.text(String.format(Locale.ROOT, "%.2f", stats.redstoneMs()), NamedTextColor.WHITE))
             .append(Component.text(" CH: ", NamedTextColor.GRAY))
             .append(Component.text(chunks, gradient(chunks / CHUNKS_FOR_RED)))
             .append(Component.text(" TOP: ", NamedTextColor.GRAY))
             .append(top)
             .build());
         bossbar.progress((float) ratio);
-        bossbar.color(ratio < 0.5 ? BossBar.Color.GREEN : ratio < 0.8 ? BossBar.Color.YELLOW : BossBar.Color.RED);
+        bossbar.color(ratio < 0.8 ? BossBar.Color.GREEN : ratio < 1.0 ? BossBar.Color.YELLOW : BossBar.Color.RED);
     }
 
     /**

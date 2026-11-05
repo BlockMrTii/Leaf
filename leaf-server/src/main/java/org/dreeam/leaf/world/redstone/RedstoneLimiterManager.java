@@ -12,17 +12,53 @@ import org.jspecify.annotations.Nullable;
 import java.lang.ref.WeakReference;
 import java.util.concurrent.ConcurrentHashMap;
 
-/** Per-world accounting on the world's tick thread; only published statistics may be read from other threads. */
+/**
+ * Virtual chunk time, triggered by the tick time (MSPT) of the server. Per-world accounting on the world's tick thread; only
+ * published statistics may be read from other threads.
+ * <p>
+ * As long as the smoothed MSPT stays below the threshold nothing is changed. Above it, all chunks with recent scheduled block ticks
+ * (plus their neighbours) are grouped by connectivity, and every group gets its own clock that runs at one common speed. That speed is
+ * lowered step by step while the MSPT is above the threshold and raised again once it is below the recovery limit.
+ * <p>
+ * A chunk's own clock is the server tick minus its lag. Only chunks inside a group have a lag; a chunk that leaves its group is moved
+ * back to the server clock at once (its pending ticks are shifted, the remaining delays stay the same), so nothing has to catch up.
+ */
 public final class RedstoneLimiterManager {
 
     // Weak references: the world owns its manager, an unloaded world must not be kept alive by this lookup table.
     private static final ConcurrentHashMap<String, WeakReference<RedstoneLimiterManager>> MANAGERS = new ConcurrentHashMap<>();
 
+    // Tick duration of the whole server, published once per server tick by MinecraftServer (single writer: the main thread).
+    // The sequence number is written last, a world that sees a new sequence also sees the matching (or a newer) duration.
+    private static volatile long serverTickNanos;
+    private static volatile long serverTickSeq;
+
+    /** Called by the server at the end of every server tick with the duration of that tick (without the wait for the next tick). */
+    public static void onServerTickEnd(long tickNanos) {
+        serverTickNanos = tickNanos;
+        serverTickSeq = serverTickSeq + 1L;
+    }
+
+    /**
+     * The game time as seen by the clock of the chunk at {@code pos}: the server time minus the lag of its group. Things that are
+     * stamped and compared in game time but belong to a block ticking on the chunk's clock must use this (e.g. redstone torch burnout).
+     */
+    public static long chunkTime(net.minecraft.world.level.Level level, net.minecraft.core.BlockPos pos) {
+        long time = level.getGameTime();
+        final RedstoneLimiterManager limiter = level.redstoneBlockEntityLimiter;
+        if (limiter != null && limiter.hasLag()) {
+            time -= limiter.lagOf(ChunkPos.pack(pos));
+        }
+        return time;
+    }
+
     public record Stats(
         boolean measuring,
         boolean throttling,
+        double msptMs,
+        double speed,
         double redstoneMs,
-        int hotChunks,
+        int activeChunks,
         int throttledChunks,
         int groups,
         boolean hasHottest,
@@ -30,7 +66,7 @@ public final class RedstoneLimiterManager {
         int hottestChunkZ,
         double hottestMs
     ) {
-        public static final Stats EMPTY = new Stats(false, false, 0.0, 0, 0, 0, false, 0, 0, 0.0);
+        public static final Stats EMPTY = new Stats(false, false, 0.0, 1.0, 0.0, 0, 0, 0, false, 0, 0, 0.0);
     }
 
     private volatile Stats publishedStats = Stats.EMPTY;
@@ -38,48 +74,51 @@ public final class RedstoneLimiterManager {
     private double worldEmaMs;
     private int ticksSinceStats;
 
-    private static final long DEBT_LIMIT_FACTOR = 2L;
     private static final long ACTIVITY_WINDOW_TICKS = 100L; // a chunk counts as running redstone for this long after its last scheduled tick
-    private static final long GROUP_REFRESH_TICKS = 20L;
-    private static final long VIRTUAL_GROUP_REFRESH_TICKS = 5L; // virtual time: a moving machine must not outrun the group
-    private final LongArrayList propagationQueue = new LongArrayList();
+    private static final long GROUP_REFRESH_TICKS = 5L; // the group set follows the activity, a moving machine must not outrun its group
+    // The controller changes the speed slowly: the MSPT average lags behind the effect of a speed change, fast steps would oscillate.
+    private static final double SPEED_STEP_DOWN = 0.004; // per tick, up to 5 times as much for a strong overload
+    private static final double SPEED_STEP_UP = 0.002; // per tick
+    private static final double MSPT_SAMPLE_LIMIT_FACTOR = 20.0; // only a huge outlier is cut: expensive executed ticks of a slowed group are real load
+    private static final int MSPT_WARMUP_TICKS = 100;
+    private static final int START_DELAY_TICKS = 20; // the smoothed MSPT must stay above the threshold this long, a single freeze (GC) must not start the slowdown
+    private static final double SPEED_JITTER = 0.1; // +-10% on the speed of every group tick: an exactly periodic skip pattern would starve block entities that act on gameTime % N
+    private final LongOpenHashSet remaining = new LongOpenHashSet();
+    private final LongArrayList queue = new LongArrayList();
     private Long2ObjectOpenHashMap<Group> memberSpare = new Long2ObjectOpenHashMap<>();
     private long lastGroupRebuild;
-    private boolean lastPropagate = true;
-    private int lastMaxGroupChunks = 256;
 
     private final String worldName;
-    private long cachedAllowanceNanos = 2_000_000L; // refreshed once per server tick in endTick, keeps record() free of floating point work
     private final Long2ObjectOpenHashMap<ChunkState> chunks = new Long2ObjectOpenHashMap<>();
     private Long2ObjectOpenHashMap<Group> memberGroup = new Long2ObjectOpenHashMap<>();
     private final java.util.ArrayList<Group> groups = new java.util.ArrayList<>();
-    private final LongOpenHashSet remaining = new LongOpenHashSet();
-    private final LongArrayList queue = new LongArrayList();
-    // Intrusive pending list; only hot or touched states remain queued between ticks.
+    // Intrusive pending list; only states touched in the current tick are queued.
     private ChunkState pending;
     private boolean groupsDirty;
     private int groupRadius = -1;
-    private boolean wasLocalActive;
-    // Virtual time: chunks that left a group keep their lag (server clock minus the chunk's own clock) until they caught up
-    private final Long2LongOpenHashMap releasedLag = new Long2LongOpenHashMap();
+    private boolean wasVirtual;
+    // MSPT controller
+    private long lastServerSeq;
+    private double msptEma;
+    private int warmupTicks = MSPT_WARMUP_TICKS;
+    private int overTicks; // consecutive ticks the smoothed MSPT was at or above the threshold while not throttling
+    private boolean throttling; // the smoothed MSPT reached the threshold and has not recovered yet (also true in monitor-only)
+    private double speed = 1.0; // common speed of all groups, 1.0 = real time
+    private boolean loggedStart;
+    private boolean tracking; // endTick has run with the limiter enabled, so there is something to clear when it is switched off
+    private long jitterState = 0x9E3779B97F4A7C15L;
+    // Virtual time: only chunks inside a group have a lag (server clock minus the chunk's own clock)
     private boolean hasLag;
+    private boolean tickSlowBlockEntities; // slow-block-entities as of the start of this tick, so all decisions of one tick agree
     private final Long2LongOpenHashMap coupledUntil = new Long2LongOpenHashMap(); // chunks of a moved structure, kept as group members until then
     private Long2LongOpenHashMap pendingShift = new Long2LongOpenHashMap();
     private final LongArrayList shiftScratch = new LongArrayList();
     private boolean anySkipping;
-    private double catchPhase;
     private long currentTick;
-    private long lastTick;
-    private boolean hasTick;
     private long lastSweep;
     private boolean hasSweep;
     private long lastLog;
     private boolean hasLog;
-    private long lastBudgetLog;
-    private boolean hasBudgetLog;
-    private long budgetExceededTicks;
-    private long budgetDeferredTicks;
-    private long maxBudgetNanos;
 
     public RedstoneLimiterManager(String worldName) {
         this.worldName = worldName;
@@ -105,7 +144,8 @@ public final class RedstoneLimiterManager {
      * and block entities of this tick all see the same decision and the same lag.
      */
     public void beginTick() {
-        this.advanceVirtualClocks(this.cachedAllowanceNanos);
+        this.tickSlowBlockEntities = RedstoneLimiter.slowBlockEntities;
+        this.advanceVirtualClocks();
     }
 
     /** Trigger tick shifts (chunk key to delta) that follow a lag change of chunks, applied by the scheduled tick code. */
@@ -122,8 +162,9 @@ public final class RedstoneLimiterManager {
         return out;
     }
 
+    /** True while the groups run on a slowed clock: the MSPT threshold is reached and the limiter is not in monitor-only mode. */
     private boolean isVirtual() {
-        return RedstoneLimiter.virtualTime && this.isLocalActive();
+        return RedstoneLimiter.enabled && !RedstoneLimiter.monitorOnly && this.throttling;
     }
 
     /** True while any chunk is behind real time, the scheduled tick code then converts times through {@link #lagOf}. */
@@ -131,10 +172,10 @@ public final class RedstoneLimiterManager {
         return this.hasLag;
     }
 
-    /** Ticks the chunk's own clock is behind the server clock (0 for normal chunks). */
+    /** Ticks the chunk's own clock is behind the server clock (0 for chunks outside of a group). */
     public long lagOf(long chunkKey) {
         Group group = this.memberGroup.get(chunkKey);
-        return group != null ? group.lag : this.releasedLag.get(chunkKey);
+        return group != null ? group.lag : 0L;
     }
 
     /** True while some group skips the current server tick (virtual time). */
@@ -143,60 +184,39 @@ public final class RedstoneLimiterManager {
     }
 
     public boolean skipsBlockEntity(net.minecraft.core.BlockPos pos) {
-        if (pos == null || !RedstoneLimiter.slowBlockEntities) { // some tickers have no position
+        if (pos == null || !this.anySkipping || !this.tickSlowBlockEntities) { // some tickers have no position
             return false;
         }
         Group group = this.memberGroup.get(net.minecraft.world.level.ChunkPos.pack(pos));
         return group != null && group.skip;
     }
 
+    /**
+     * True while some group skips this server tick, so the scheduled tick code has to ask for admission. The decision is taken at the
+     * start of the tick and does not change within it, whatever happens to the config.
+     */
     public boolean isLocalActive() {
-        return RedstoneLimiter.enabled && !RedstoneLimiter.monitorOnly && RedstoneLimiter.chunkThrottling
-            && RedstoneLimiter.groupBudgetMs > 0.0 && Double.isFinite(RedstoneLimiter.groupBudgetMs);
+        return this.anySkipping;
     }
 
     public boolean admitScheduledTick(long chunkKey, long gameTime) {
-        if (this.groups.isEmpty() || !this.isLocalActive()) {
+        if (!this.anySkipping) {
             return true;
         }
         Group group = this.memberGroup.get(chunkKey);
-        if (group == null) {
-            return true;
-        }
-        if (RedstoneLimiter.virtualTime) {
-            if (group.skip) {
-                group.lastRejected = gameTime;
-                this.markHeldBack(chunkKey, gameTime);
-                return false;
-            }
-            return true;
-        }
-        // Comparing avoids overflowing balance - admittedEstimateNanos.
-        if (group.balanceNanos <= group.admittedEstimateNanos) {
-            group.lastRejected = gameTime;
+        if (group != null && group.skip) {
             this.markHeldBack(chunkKey, gameTime);
             return false;
         }
-        long estimate = Math.max(1L, (long) group.avgCostNanos);
-        group.admittedEstimateNanos += Math.min(estimate, Long.MAX_VALUE - group.admittedEstimateNanos);
         return true;
     }
 
     public boolean mayRunBlockEvents(long chunkKey, long gameTime) {
-        if (this.groups.isEmpty() || !(RedstoneLimiter.slowPistons || RedstoneLimiter.virtualTime) || !this.isLocalActive()) {
+        if (!this.anySkipping) {
             return true;
         }
         Group group = this.memberGroup.get(chunkKey);
-        if (group != null && RedstoneLimiter.virtualTime) {
-            if (group.skip) {
-                group.lastRejected = gameTime;
-                this.markHeldBack(chunkKey, gameTime);
-                return false;
-            }
-            return true;
-        }
-        if (group != null && group.balanceNanos <= 0) {
-            group.lastRejected = gameTime;
+        if (group != null && group.skip) {
             this.markHeldBack(chunkKey, gameTime);
             return false;
         }
@@ -204,9 +224,9 @@ public final class RedstoneLimiterManager {
     }
 
     /**
-     * A chunk that still has work but is held back by the limiter stays active. Otherwise the throttling would drop it from the
-     * group after the activity window and let its pending work run unthrottled. Only called on rejection, so the lookup and the
-     * rare state creation stay off the admitted fast path.
+     * A chunk that still has work but is held back by the limiter stays active. Otherwise it would drop out of its group after the
+     * activity window and let its pending work run on the server clock. Only called on rejection, so the lookup and the rare state
+     * creation stay off the admitted fast path.
      */
     private void markHeldBack(long chunkKey, long gameTime) {
         ChunkState held = this.chunks.get(chunkKey);
@@ -215,59 +235,14 @@ public final class RedstoneLimiterManager {
             this.chunks.put(chunkKey, held);
         }
         held.lastActivity = gameTime;
-        held.lastHeld = gameTime;
-    }
-
-    public boolean isBudgetActive() {
-        // with virtual time a group tick is atomic, the hand back of the global budget would split it
-        return !this.isVirtual() && RedstoneLimiter.enabled && !RedstoneLimiter.monitorOnly && RedstoneLimiter.executionBudgetMs > 0.0;
-    }
-
-    public long budgetNanos() {
-        return this.isBudgetActive() ? (long) (RedstoneLimiter.executionBudgetMs * 1_000_000.0) : 0;
-    }
-
-    public void onBudgetExceeded(long gameTime, int deferredTicks, long usedNanos) {
-        if (!this.isBudgetActive() || deferredTicks <= 0 || !RedstoneLimiter.logWarnings) {
-            return;
-        }
-        if (this.budgetExceededTicks < Long.MAX_VALUE) {
-            ++this.budgetExceededTicks;
-        }
-        this.budgetDeferredTicks += Math.min((long) deferredTicks, Long.MAX_VALUE - this.budgetDeferredTicks);
-        this.maxBudgetNanos = Math.max(this.maxBudgetNanos, usedNanos);
-        if (!RedstoneLimiter.logWarnings
-            || (this.hasBudgetLog && elapsed(gameTime, this.lastBudgetLog) < Math.max(1, RedstoneLimiter.logIntervalTicks))) {
-            return;
-        }
-        this.lastBudgetLog = gameTime;
-        this.hasBudgetLog = true;
-        LeafConfig.LOGGER.warn("Redstone limiter: world={}, budget exceeded in {} ticks, deferred={} ticks total (last={}), used={} ms, max={} ms, budget={} ms",
-            this.worldName, this.budgetExceededTicks, this.budgetDeferredTicks, deferredTicks,
-            usedNanos / 1_000_000.0, this.maxBudgetNanos / 1_000_000.0, RedstoneLimiter.executionBudgetMs);
-        this.budgetExceededTicks = 0;
-        this.budgetDeferredTicks = 0;
-        this.maxBudgetNanos = 0;
     }
 
     public void record(long chunkKey, long measuredNanos) {
         long nanos = Math.max(1L, measuredNanos); // a measurement below the timer resolution still counts as activity
-        if (!RedstoneLimiter.enabled || (!RedstoneLimiter.chunkThrottling && !RedstoneLimiter.monitorOnly) || nanos <= 0) {
+        if (!RedstoneLimiter.enabled) {
             return;
         }
         this.worldTickNanos += Math.min(nanos, Long.MAX_VALUE - this.worldTickNanos);
-        if (!this.groups.isEmpty() && this.isLocalActive()) {
-            Group group = this.memberGroup.get(chunkKey);
-            if (group != null) {
-                // Debt is capped at DEBT_LIMIT_FACTOR allowances: one indivisible cascade can then cost at most a few paused ticks
-                // instead of a long freeze, in exchange the target rate may be exceeded by huge single cascades.
-                long floor = -DEBT_LIMIT_FACTOR * this.cachedAllowanceNanos;
-                // Clamp before subtraction, even for an implausibly large duration.
-                group.balanceNanos = Math.max(floor, group.balanceNanos - Math.min(nanos, group.balanceNanos - floor));
-                group.avgCostNanos += 0.25 * ((double) nanos - group.avgCostNanos);
-                group.spentNanos += Math.min(nanos, Long.MAX_VALUE - group.spentNanos);
-            }
-        }
         ChunkState state = this.chunks.get(chunkKey);
         if (state == null) {
             // first contact: one small allocation per chunk, only for chunks that actually ran scheduled ticks
@@ -281,54 +256,33 @@ public final class RedstoneLimiterManager {
     public void endTick(long gameTime) {
         RedstoneBarTask.ensureStarted();
         this.currentTick = gameTime == Long.MAX_VALUE ? Long.MAX_VALUE : gameTime + 1;
-        if (!RedstoneLimiter.enabled || (!RedstoneLimiter.chunkThrottling && !RedstoneLimiter.monitorOnly)) {
+        if (!RedstoneLimiter.enabled) {
             this.clearTracking();
             return;
         }
+        this.tracking = true;
+        this.updateMspt();
+        this.updateController(gameTime);
+        boolean virtual = this.isVirtual();
         // virtual time runs a group in 1 of N ticks, the cost per server tick is bursty (full tick, then nothing) with a period of up
         // to 1/minSpeed ticks, so the displayed load needs a window that covers several periods
-        this.worldEmaMs += (!this.groups.isEmpty() && this.isVirtual() ? 0.03 : 0.2) * (this.worldTickNanos / 1_000_000.0 - this.worldEmaMs);
+        this.worldEmaMs += (!this.groups.isEmpty() && virtual ? 0.03 : 0.2) * (this.worldTickNanos / 1_000_000.0 - this.worldEmaMs);
         this.worldTickNanos = 0;
         int window = Math.max(1, RedstoneLimiter.emaWindowTicks);
         double alpha = 2.0 / (window + 1.0);
         double decay = 1.0 - alpha;
-        boolean localActive = this.isLocalActive();
         int radius = Math.clamp(RedstoneLimiter.neighborRadius, 0, 2);
-        if (localActive != this.wasLocalActive || radius != this.groupRadius) {
+        if (virtual != this.wasVirtual || radius != this.groupRadius) {
             this.groupsDirty = true;
         }
-        this.wasLocalActive = localActive;
+        this.wasVirtual = virtual;
         this.groupRadius = radius;
-        boolean budgetEnabled = validChunkBudget();
-        double recovery = RedstoneLimiter.recoveryRatio;
-        recovery = Double.isFinite(recovery) ? Math.clamp(recovery, 0.0, 1.0) : 0.5;
-        long cooldown = Math.max(0, RedstoneLimiter.cooldownTicks);
-        // A gap or clock reset cannot count as consecutive rejection-free server ticks.
-        boolean consecutive = this.hasTick && this.lastTick != Long.MAX_VALUE && gameTime == this.lastTick + 1;
-        long allowance = allowanceNanos();
-        this.cachedAllowanceNanos = allowance;
-        for (int i = 0; i < this.groups.size(); ++i) {
-            Group group = this.groups.get(i);
-            if (!consecutive) {
-                group.lastRejected = gameTime;
-            }
-            group.balanceNanos = Math.clamp(group.balanceNanos, -DEBT_LIMIT_FACTOR * allowance, 2 * allowance);
-            group.balanceNanos = Math.min(2 * allowance, group.balanceNanos + allowance);
-            group.admittedEstimateNanos = 0;
-        }
-        this.updateGroupCosts();
 
-        int hotChunks = 0;
-        boolean hasHottest = false;
-        long hottestChunk = 0;
-        double hottestMs = 0.0;
-        boolean virtualTime = this.isVirtual();
         ChunkState state = this.pending;
         while (state != null) {
             ChunkState next = state.next;
-            // virtual time: a tick the chunk's group skips has no cost by design. Measuring it as zero would make the throttling look
-            // like a recovery, so only ticks the group executed enter the average (the cost per executed tick stays comparable)
-            Group chunkGroup = virtualTime ? this.memberGroup.get(state.chunkKey) : null;
+            // virtual time: a tick the chunk's group skips has no cost by design, so it must not enter the average
+            Group chunkGroup = virtual ? this.memberGroup.get(state.chunkKey) : null;
             if (chunkGroup != null && chunkGroup.skip) {
                 state.tickNanos = 0;
                 state.lastUpdate = gameTime;
@@ -344,73 +298,31 @@ public final class RedstoneLimiterManager {
                     state.lastActivity = gameTime;
                 }
             }
-            boolean wasHot = state.hot;
-            if (!budgetEnabled) {
-                state.hot = false;
-            } else if (state.hot) {
-                // only the chunk's OWN held back work keeps it hot, otherwise rejections of a neighbouring farm in the same group
-                // would keep an idle anchor chunk (and with it the whole group) throttled forever
-                long rejection = Math.max(state.enteredAt, state.lastHeld);
-                // virtual time: a group that would still throttle (its cost per executed tick is above the budget) is not released, a
-                // pulsing machine has idle executed ticks in between that would otherwise look like a recovery of the chunk
-                boolean stillThrottled = chunkGroup != null && chunkGroup.avgRunNanos > allowance * recovery;
-                if (!stillThrottled && state.emaMs <= RedstoneLimiter.chunkBudgetMs * recovery
-                    && elapsed(gameTime, state.enteredAt) >= cooldown && elapsed(gameTime, rejection) >= cooldown) {
-                    state.hot = false;
-                }
-            } else if (state.emaMs >= RedstoneLimiter.chunkBudgetMs) {
-                state.hot = true;
-                state.enteredAt = gameTime;
-            }
-            if (state.hot != wasHot) {
-                this.groupsDirty = true;
-                this.logTransition(state, gameTime, state.hot);
-            }
-            if (state.emaMs > hottestMs) {
-                hasHottest = true;
-                hottestChunk = state.chunkKey;
-                hottestMs = state.emaMs;
-            }
-            if (state.hot) {
-                ++hotChunks;
-            }
-            if (!state.hot) {
-                // the state stays in the map (not queued) so its activity can still count for spreading, the sweep removes it later
-                this.unlink(state);
-            }
+            // the state stays in the map (not queued) so its activity can still count for the groups, the sweep removes it later
+            this.unlink(state);
             state = next;
         }
-        // chunk activity changes without the hot set changing, so a spreading group is refreshed regularly
-        if (!this.groups.isEmpty() && RedstoneLimiter.propagateActiveChunks && elapsed(gameTime, this.lastGroupRebuild) >= (virtualTime ? VIRTUAL_GROUP_REFRESH_TICKS : GROUP_REFRESH_TICKS)) {
-            this.groupsDirty = true;
-        }
-        // a changed propagation setting (config reload) must rebuild the groups, also when switching spreading off
-        if (RedstoneLimiter.propagateActiveChunks != this.lastPropagate || RedstoneLimiter.maxGroupChunks != this.lastMaxGroupChunks) {
-            this.lastPropagate = RedstoneLimiter.propagateActiveChunks;
-            this.lastMaxGroupChunks = RedstoneLimiter.maxGroupChunks;
+        // chunk activity changes continuously, so the groups follow it regularly while the clocks are slowed
+        if (virtual && elapsed(gameTime, this.lastGroupRebuild) >= GROUP_REFRESH_TICKS) {
             this.groupsDirty = true;
         }
         if (this.groupsDirty) {
-            this.rebuildGroups(gameTime, allowance, localActive);
+            this.rebuildGroups(gameTime, virtual);
         }
         Stats previousStats = this.publishedStats;
-        if (++this.ticksSinceStats >= 10 || !previousStats.measuring() || previousStats.throttling() != localActive) {
-            this.publishedStats = new Stats(true, localActive, this.worldEmaMs, hotChunks, this.memberGroup.size(),
-                this.groups.size(), hasHottest, ChunkPos.getX(hottestChunk), ChunkPos.getZ(hottestChunk), hottestMs);
+        if (++this.ticksSinceStats >= 10 || !previousStats.measuring() || previousStats.throttling() != this.throttling) {
+            this.publishStats(gameTime);
             this.ticksSinceStats = 0;
         }
-        this.lastTick = gameTime;
-        this.hasTick = true;
         if (!this.hasSweep || elapsed(gameTime, this.lastSweep) >= 1200) {
             this.lastSweep = gameTime;
             this.hasSweep = true;
-            // keep chunk data at least as long as the activity window plus a group refresh, otherwise the spreading loses its data
-            long retention = Math.max((long) window * 4, ACTIVITY_WINDOW_TICKS + GROUP_REFRESH_TICKS + 1);
+            // keep chunk data at least as long as the longest activity window (slowest speed) plus a group refresh, otherwise the groups lose their data
+            long retention = Math.max((long) window * 4, (long) Math.ceil(ACTIVITY_WINDOW_TICKS / minSpeed()) + GROUP_REFRESH_TICKS + 1);
             var iterator = this.chunks.long2ObjectEntrySet().fastIterator();
             while (iterator.hasNext()) {
                 ChunkState candidate = iterator.next().getValue();
-                if (!candidate.queued && elapsed(gameTime, candidate.lastActivity) >= retention
-                    && (candidate.savedRunNanos <= 0.0 || elapsed(gameTime, candidate.savedAt) >= 1200)) { // keep the saved cost of a released group
+                if (!candidate.queued && elapsed(gameTime, candidate.lastActivity) >= retention) {
                     iterator.remove();
                 }
             }
@@ -418,37 +330,139 @@ public final class RedstoneLimiterManager {
     }
 
     /**
-     * End of a server tick, before the groups are rebuilt: the cost of the tick a group executed goes into its average. An executed
-     * tick without cost counts too, so an idle group speeds up again.
+     * Smoothed tick time of the SERVER (what /mspt shows, all worlds and the work around them): one sample per finished server tick.
+     * A world that is ticked once per server tick sees every new sample once, the sample is the tick before the current one.
      */
-    private void updateGroupCosts() {
-        boolean virtual = this.isVirtual();
-        for (int i = 0; i < this.groups.size(); ++i) {
-            Group group = this.groups.get(i);
-            if (virtual && !group.skip) {
-                // rises quickly, falls slowly: bursty machines (clocks with pauses) must not make the speed jump up on every idle tick
-                double delta = (double) group.spentNanos - group.avgRunNanos;
-                group.avgRunNanos += (delta > 0.0 ? 0.25 : 0.05) * delta;
-            }
-            group.spentNanos = 0;
+    private void updateMspt() {
+        final long seq = serverTickSeq;
+        if (seq == this.lastServerSeq) {
+            return; // no new server tick since the last sample (e.g. frozen ticks)
         }
+        this.lastServerSeq = seq;
+        if (this.warmupTicks > 0) {
+            --this.warmupTicks; // world load and the first ticks after enabling are no sample
+            return;
+        }
+        // Only a huge outlier is cut: the expensive executed ticks of a slowed group are real load and must stay in the signal
+        double limit = RedstoneLimiter.msptThreshold * MSPT_SAMPLE_LIMIT_FACTOR;
+        double sample = Math.min(serverTickNanos / 1_000_000.0, limit);
+        double alpha = 2.0 / (Math.max(1, RedstoneLimiter.emaWindowTicks) + 1.0);
+        this.msptEma += alpha * (sample - this.msptEma);
     }
 
     /**
-     * Virtual time: decides for the NEXT server tick whether a group runs or is skipped. The group's speed is its time allowance
-     * divided by the measured cost of a tick it ran; a fractional accumulator spreads the skipped ticks evenly. A skipped tick
-     * adds one tick of lag so the group's own clock (server tick minus lag) stands still.
+     * Starts the slowdown when the smoothed MSPT reaches the threshold. While it is above, the common speed falls (faster the larger
+     * the overload), between the recovery limit and the threshold it is held, below the recovery limit it rises until real time is
+     * reached and the groups are released.
      */
-    private void advanceVirtualClocks(long allowance) {
+    private void updateController(long gameTime) {
+        double threshold = RedstoneLimiter.msptThreshold;
+        double recovery = Double.isFinite(RedstoneLimiter.msptRecoveryRatio) ? Math.clamp(RedstoneLimiter.msptRecoveryRatio, 0.5, 0.99) : 0.9;
+        if (minSpeed() >= 1.0) {
+            // a minimum speed of 1.0 means no slowdown is possible: no groups that skip nothing
+            this.overTicks = 0;
+            if (this.throttling) {
+                this.release();
+            }
+            return;
+        }
+        if (this.msptEma >= threshold) {
+            if (!this.throttling) {
+                if (++this.overTicks < START_DELAY_TICKS) {
+                    return; // only a sustained overload starts the slowdown, not a single freeze
+                }
+                this.throttling = true;
+                this.groupsDirty = true;
+                this.logStart(gameTime);
+            }
+            double overload = Math.min(1.0, this.msptEma / threshold - 1.0);
+            this.speed = Math.max(minSpeed(), this.speed - SPEED_STEP_DOWN * (1.0 + 4.0 * overload));
+        } else {
+            this.overTicks = 0;
+            if (this.throttling) {
+                this.speed = Math.max(minSpeed(), this.speed); // a raised min-speed (config reload) takes effect right away
+                if (this.msptEma < threshold * recovery) {
+                    this.speed = Math.min(1.0, this.speed + SPEED_STEP_UP);
+                    if (this.speed >= 1.0) {
+                        this.release();
+                    }
+                }
+            }
+        }
+    }
+
+    /** End of the slowdown: the groups are dissolved by the next rebuild and every chunk goes back to the server clock. */
+    private void release() {
+        this.speed = 1.0;
+        this.throttling = false;
+        this.groupsDirty = true;
+        this.logEnd();
+    }
+
+    /**
+     * How long a chunk counts as running redstone after its last scheduled tick. Measured in server ticks, but a slowed chunk executes
+     * a scheduled tick only every 1/speed server ticks, so the window grows with the slowdown (otherwise a slow machine would drop out
+     * of its group between two of its own ticks).
+     */
+    private long activityWindow() {
+        if (!this.isVirtual()) {
+            return ACTIVITY_WINDOW_TICKS;
+        }
+        return (long) Math.ceil(ACTIVITY_WINDOW_TICKS / Math.clamp(this.speed, minSpeed(), 1.0));
+    }
+
+    /** Random factor around 1.0 (xorshift, deterministic, no allocation). */
+    private double nextJitter() {
+        long x = this.jitterState;
+        x ^= x << 13;
+        x ^= x >>> 7;
+        x ^= x << 17;
+        this.jitterState = x;
+        return 1.0 - SPEED_JITTER + 2.0 * SPEED_JITTER * ((x >>> 11) * 0x1.0p-53);
+    }
+
+    private static double minSpeed() {
+        return Double.isFinite(RedstoneLimiter.minSpeed) ? Math.clamp(RedstoneLimiter.minSpeed, 0.02, 1.0) : 0.1;
+    }
+
+    private void publishStats(long gameTime) {
+        int active = 0;
+        boolean hasHottest = false;
+        long hottestChunk = 0;
+        double hottestMs = 0.0;
+        final long window = this.activityWindow();
+        var iterator = this.chunks.long2ObjectEntrySet().fastIterator();
+        while (iterator.hasNext()) {
+            ChunkState candidate = iterator.next().getValue();
+            if (elapsed(gameTime, candidate.lastActivity) <= window) {
+                ++active;
+                if (candidate.emaMs > hottestMs) {
+                    hasHottest = true;
+                    hottestChunk = candidate.chunkKey;
+                    hottestMs = candidate.emaMs;
+                }
+            }
+        }
+        this.publishedStats = new Stats(true, this.throttling, this.msptEma, this.speed, this.worldEmaMs, active, this.memberGroup.size(),
+            this.groups.size(), hasHottest, ChunkPos.getX(hottestChunk), ChunkPos.getZ(hottestChunk), hottestMs);
+    }
+
+    /**
+     * Virtual time: decides for the NEXT server tick whether a group runs or is skipped. All groups share one speed; a fractional
+     * accumulator spreads the skipped ticks evenly and each group starts at a phase of its own. A skipped tick adds one tick of lag
+     * so the group's own clock (server tick minus lag) stands still.
+     */
+    private void advanceVirtualClocks() {
         boolean virtual = this.isVirtual();
         boolean skipping = false;
         boolean lagging = false;
-        double minSpeed = Double.isFinite(RedstoneLimiter.minSpeed) ? Math.clamp(RedstoneLimiter.minSpeed, 0.02, 1.0) : 0.1;
+        double groupSpeed = Math.clamp(this.speed, minSpeed(), 1.0);
         for (int i = 0; i < this.groups.size(); ++i) {
             Group group = this.groups.get(i);
             if (virtual) {
-                double speed = Math.clamp(allowance / Math.max(1.0, group.avgRunNanos), minSpeed, 1.0);
-                group.phase += speed;
+                // at full speed nothing is skipped, below it the speed is dithered (see SPEED_JITTER) so that the groups do not always
+                // run in the same residue of the game time
+                group.phase += groupSpeed >= 1.0 ? 1.0 : groupSpeed * this.nextJitter();
                 if (group.phase >= 1.0) {
                     group.phase = Math.min(group.phase - 1.0, 1.0);
                     group.skip = false;
@@ -463,68 +477,21 @@ public final class RedstoneLimiterManager {
             lagging |= group.lag > 0;
         }
         this.anySkipping = skipping;
-        boolean groupsCatchUp = false;
-        if (!virtual) {
-            // virtual time was switched off: the groups' delay is worked off like the delay of released chunks
-            for (int i = 0; i < this.groups.size(); ++i) {
-                groupsCatchUp |= this.groups.get(i).lag > 0;
-            }
-        }
-        long steps = this.catchUpSteps(groupsCatchUp || !this.releasedLag.isEmpty());
-        if (steps > 0) {
-            this.drainReleasedLag(steps);
-            if (groupsCatchUp) {
-                lagging = false;
-                for (int i = 0; i < this.groups.size(); ++i) {
-                    Group group = this.groups.get(i);
-                    group.lag = Math.max(0L, group.lag - steps);
-                    lagging |= group.lag > 0;
-                }
-            }
-        }
-        this.hasLag = lagging || !this.releasedLag.isEmpty();
+        this.hasLag = lagging;
     }
 
-    /** Chunks outside of any group catch up with the server clock by running their own clock faster for a while. */
-    private long catchUpSteps(boolean anyLag) {
-        if (!anyLag) {
-            this.catchPhase = 0.0;
-            return 0L;
-        }
-        double extra = Double.isFinite(RedstoneLimiter.catchUpSpeed) ? Math.clamp(RedstoneLimiter.catchUpSpeed, 1.0, 4.0) - 1.0 : 0.5;
-        if (extra <= 0.0) {
-            return 0L;
-        }
-        this.catchPhase += extra;
-        long steps = (long) this.catchPhase;
-        this.catchPhase -= steps;
-        return steps;
-    }
-
-    private void drainReleasedLag(long steps) {
-        var iterator = this.releasedLag.long2LongEntrySet().fastIterator();
-        while (iterator.hasNext()) {
-            var entry = iterator.next();
-            long remaining = entry.getLongValue() - steps;
-            if (remaining <= 0) {
-                iterator.remove();
-            } else {
-                entry.setValue(remaining);
-            }
-        }
-    }
-
-    private void rebuildGroups(long gameTime, long allowance, boolean localActive) {
+    private void rebuildGroups(long gameTime, boolean virtual) {
         this.groupsDirty = false;
         this.remaining.clear();
-        if (localActive) {
-            for (ChunkState state = this.pending; state != null; state = state.next) {
-                if (state.hot) {
-                    this.addNeighbors(state.chunkKey, this.groupRadius);
+        if (virtual) {
+            // every chunk with recent scheduled ticks (or held back work) is a seed, connected seeds form one group
+            final long window = this.activityWindow();
+            var seeds = this.chunks.long2ObjectEntrySet().fastIterator();
+            while (seeds.hasNext()) {
+                ChunkState seed = seeds.next().getValue();
+                if (elapsed(gameTime, seed.lastActivity) <= window) {
+                    this.addNeighbors(seed.chunkKey, this.groupRadius);
                 }
-            }
-            if (RedstoneLimiter.propagateActiveChunks) {
-                this.propagateToActiveChunks(gameTime);
             }
             if (!this.coupledUntil.isEmpty()) {
                 var coupled = this.coupledUntil.long2LongEntrySet().fastIterator();
@@ -549,45 +516,24 @@ public final class RedstoneLimiterManager {
             this.remaining.remove(first);
             this.queue.clear();
             this.queue.add(first);
-            Group group = new Group(allowance, gameTime);
-            // a new group starts at a phase of its own, so several throttled groups do not all execute in the same server tick
+            Group group = new Group();
+            // a new group starts at a phase of its own, so several groups do not all execute in the same server tick
             group.phase = (double) ((first * 0x9E3779B97F4A7C15L) >>> 11) / (double) (1L << 53);
-            boolean inherited = false;
             boolean phaseInherited = false;
             for (int index = 0; index < this.queue.size(); ++index) {
                 long key = this.queue.getLong(index);
                 replacement.put(key, group);
                 // a chunk joining the group takes the highest delay of the members, so the group clock never runs ahead of any member;
                 // the chunk's pending ticks are shifted by the difference afterwards (remaining own ticks stay the same)
-                long releasedChunkLag = this.releasedLag.remove(key);
                 Group previous = this.memberGroup.get(key);
-                long ownLag = previous != null ? previous.lag : releasedChunkLag;
+                long ownLag = previous != null ? previous.lag : 0L; // outside of a group a chunk is on the server clock
                 this.shiftScratch.add(key);
                 this.shiftScratch.add(ownLag);
                 group.lag = Math.max(group.lag, ownLag);
-                if (previous != null) {
-                    group.avgRunNanos = Math.max(group.avgRunNanos, previous.avgRunNanos);
-                    if (!phaseInherited) {
-                        group.phase = previous.phase;
-                        group.skip = previous.skip;
-                        phaseInherited = true;
-                    }
-                    if (!inherited) {
-                        group.balanceNanos = previous.balanceNanos;
-                        group.avgCostNanos = previous.avgCostNanos;
-                        group.lastRejected = previous.lastRejected;
-                        inherited = true;
-                    } else {
-                        group.balanceNanos = Math.min(group.balanceNanos, previous.balanceNanos);
-                        group.avgCostNanos = Math.max(group.avgCostNanos, previous.avgCostNanos);
-                        group.lastRejected = Math.max(group.lastRejected, previous.lastRejected);
-                    }
-                } else {
-                    // a chunk that was released recently brings its known cost back, so the new group does not start unthrottled
-                    ChunkState known = this.chunks.get(key);
-                    if (known != null && known.savedRunNanos > 0.0 && elapsed(gameTime, known.savedAt) <= 1200) {
-                        group.avgRunNanos = Math.max(group.avgRunNanos, known.savedRunNanos);
-                    }
+                if (previous != null && !phaseInherited) {
+                    group.phase = previous.phase;
+                    group.skip = previous.skip;
+                    phaseInherited = true;
                 }
                 long x = ChunkPos.getX(key);
                 long z = ChunkPos.getZ(key);
@@ -611,68 +557,23 @@ public final class RedstoneLimiterManager {
             this.shiftScratch.clear();
             this.groups.add(group);
         }
-        // chunks that dropped out of every group keep their lag and catch up
+        // chunks that dropped out of every group go back to the server clock at once: their pending ticks are shifted by the lag they
+        // had, so every remaining delay stays the same and nothing has to catch up
         var released = this.memberGroup.long2ObjectEntrySet().fastIterator();
         while (released.hasNext()) {
             var entry = released.next();
-            if (!replacement.containsKey(entry.getLongKey())) {
-                ChunkState known = this.chunks.get(entry.getLongKey());
-                if (known != null) {
-                    known.savedRunNanos = entry.getValue().avgRunNanos;
-                    known.savedAt = gameTime;
-                }
-                if (entry.getValue().lag > 0) {
-                    this.releasedLag.put(entry.getLongKey(), entry.getValue().lag);
-                }
+            if (!replacement.containsKey(entry.getLongKey()) && entry.getValue().lag > 0) {
+                this.pendingShift.addTo(entry.getLongKey(), entry.getValue().lag);
             }
         }
         this.memberSpare = this.memberGroup;
         this.memberGroup = replacement;
-        this.hasLag = this.hasLag || !this.releasedLag.isEmpty();
+        boolean lagging = false;
+        for (int i = 0; i < this.groups.size() && !lagging; ++i) {
+            lagging = this.groups.get(i).lag > 0;
+        }
+        this.hasLag = lagging;
         this.queue.clear();
-    }
-
-    /**
-     * Spreads the throttled set over neighbouring chunks that recently ran scheduled ticks (redstone activity), and from those
-     * chunks on, until no active neighbour is left or maxGroupChunks additional chunks were added. Idle chunks stop the spreading.
-     */
-    private void propagateToActiveChunks(long gameTime) {
-        this.propagationQueue.clear();
-        var iterator = this.remaining.iterator();
-        while (iterator.hasNext()) {
-            long key = iterator.nextLong();
-            if (this.isRecentlyActive(key, gameTime)) {
-                this.propagationQueue.add(key); // only active (or hot) members spread further
-            }
-        }
-        int added = 0;
-        int limit = Math.max(0, RedstoneLimiter.maxGroupChunks);
-        for (int index = 0; index < this.propagationQueue.size() && added < limit; ++index) {
-            long key = this.propagationQueue.getLong(index);
-            long x = ChunkPos.getX(key);
-            long z = ChunkPos.getZ(key);
-            for (int dx = -1; dx <= 1 && added < limit; ++dx) {
-                for (int dz = -1; dz <= 1 && added < limit; ++dz) {
-                    if (validCoordinate(x + dx) && validCoordinate(z + dz)) {
-                        long neighbor = ChunkPos.pack((int) (x + dx), (int) (z + dz));
-                        if (this.isRecentlyActive(neighbor, gameTime) && this.remaining.add(neighbor)) {
-                            this.propagationQueue.add(neighbor);
-                            ++added;
-                        }
-                    }
-                }
-            }
-        }
-        if (RedstoneLimiter.virtualLookahead && this.isVirtual()) {
-            // look-ahead: the neighbours of every active member run in the same clock, so a machine that moves on (flying machine)
-            // is already inside the group when it crosses into the next chunk. The ring does not spread further.
-            int activeMembers = this.propagationQueue.size();
-            int ringStart = this.remaining.size();
-            for (int index = 0; index < activeMembers && this.remaining.size() - ringStart < limit; ++index) {
-                this.addNeighbors(this.propagationQueue.getLong(index), 1); // the ring is capped by maxGroupChunks as well
-            }
-        }
-        this.propagationQueue.clear();
     }
 
     /**
@@ -698,7 +599,7 @@ public final class RedstoneLimiterManager {
         }
         // both chunks stay members of the group while the machine works: the rebuild takes them over as anchors, otherwise a
         // chunk that joined here would drop out again and pump between the group clock and its own
-        long until = this.currentTick + ACTIVITY_WINDOW_TICKS;
+        long until = this.currentTick + this.activityWindow();
         this.coupledUntil.put(keyA, until);
         this.coupledUntil.put(keyB, until);
         if (groupA != null && groupB != null) {
@@ -707,14 +608,8 @@ public final class RedstoneLimiterManager {
         }
         Group group = groupA != null ? groupA : groupB;
         long joining = groupA != null ? keyB : keyA;
-        long ownLag = this.releasedLag.get(joining);
-        if (ownLag > group.lag) {
-            this.groupsDirty = true; // the rebuild raises the group's lag and shifts the members
-            return;
-        }
-        this.releasedLag.remove(joining);
         this.memberGroup.put(joining, group);
-        long delta = ownLag - group.lag;
+        long delta = -group.lag; // the joining chunk was on the server clock (lag 0), its pending ticks move to the group's clock
         if (delta != 0L) {
             this.pendingShift.addTo(joining, delta);
         }
@@ -725,11 +620,6 @@ public final class RedstoneLimiterManager {
         }
         state.lastActivity = this.currentTick;
         this.groupsDirty = true;
-    }
-
-    private boolean isRecentlyActive(long chunkKey, long gameTime) {
-        ChunkState state = this.chunks.get(chunkKey);
-        return state != null && (state.hot || elapsed(gameTime, state.lastActivity) <= ACTIVITY_WINDOW_TICKS);
     }
 
     private void addNeighbors(long key, int radius) {
@@ -749,9 +639,8 @@ public final class RedstoneLimiterManager {
      * entry from before it was unloaded must not give it the lag of a group.
      */
     public void onChunkLoaded(long chunkKey) {
-        if (this.hasLag || !this.memberGroup.isEmpty()) {
+        if (!this.memberGroup.isEmpty()) {
             Group group = this.memberGroup.remove(chunkKey);
-            this.releasedLag.remove(chunkKey);
             if (group != null) {
                 this.groupsDirty = true;
             }
@@ -759,28 +648,29 @@ public final class RedstoneLimiterManager {
     }
 
     public void removeChunk(long chunkKey) {
-        this.releasedLag.remove(chunkKey);
         this.coupledUntil.remove(chunkKey);
+        // an unloaded chunk leaves its group without a shift: its container is gone, and a stale member entry would make the next
+        // rebuild shift a container that is loaded again later
+        this.memberGroup.remove(chunkKey);
         ChunkState state = this.chunks.remove(chunkKey);
-        if (state != null) {
-            if (state.queued) {
-                this.unlink(state);
-            }
-            if (state.hot) {
-                this.groupsDirty = true;
-            }
+        if (state != null && state.queued) {
+            this.unlink(state);
         }
-        // Only hot-set changes alter S. A cold neighbor may still belong to S after unload. The groups are rebuilt at the end of
-        // the tick (groupsDirty), not here: a rebuild in the middle of a tick would change the skip decision and drop the costs of the tick.
+        // The groups are rebuilt at the end of the tick (the refresh interval), not here: a rebuild in the middle of a tick would
+        // change the skip decision and drop the costs of the tick.
     }
 
     private void clearTracking() {
-        // the delay of chunks that were in a group is kept so their scheduled ticks stay consistent while they catch up
+        if (!this.tracking) {
+            return; // nothing was tracked since the limiter was switched off: no work per tick while it stays off
+        }
+        this.tracking = false;
+        // chunks that were in a group go back to the server clock: their pending ticks are shifted by their lag
         var members = this.memberGroup.long2ObjectEntrySet().fastIterator();
         while (members.hasNext()) {
             var entry = members.next();
             if (entry.getValue().lag > 0) {
-                this.releasedLag.put(entry.getLongKey(), entry.getValue().lag);
+                this.pendingShift.addTo(entry.getLongKey(), entry.getValue().lag);
             }
         }
         this.anySkipping = false;
@@ -794,8 +684,15 @@ public final class RedstoneLimiterManager {
         this.groups.clear();
         this.pending = null;
         this.groupsDirty = false;
-        this.wasLocalActive = false;
-        this.hasTick = false;
+        this.wasVirtual = false;
+        this.coupledUntil.clear();
+        this.hasLag = false;
+        this.msptEma = 0.0;
+        this.overTicks = 0;
+        this.warmupTicks = MSPT_WARMUP_TICKS;
+        this.throttling = false;
+        this.speed = 1.0;
+        this.loggedStart = false;
     }
 
     private void enqueue(ChunkState state) {
@@ -823,32 +720,26 @@ public final class RedstoneLimiterManager {
         state.queued = false;
     }
 
-    private void logTransition(ChunkState state, long gameTime, boolean entering) {
+    private void logStart(long gameTime) {
+        // the end message is only logged for a logged start, so the interval cannot leave a start without its end
+        this.loggedStart = false;
         if (!RedstoneLimiter.logWarnings
             || (this.hasLog && elapsed(gameTime, this.lastLog) < Math.max(1, RedstoneLimiter.logIntervalTicks))) {
             return;
         }
         this.lastLog = gameTime;
         this.hasLog = true;
-        if (entering) {
-            LeafConfig.LOGGER.warn("Redstone limiter: world={}, hot chunk=[{}, {}], EMA={} ms, group budget={} ms, mode={}",
-                this.worldName, ChunkPos.getX(state.chunkKey), ChunkPos.getZ(state.chunkKey), state.emaMs,
-                RedstoneLimiter.groupBudgetMs, RedstoneLimiter.monitorOnly ? "would throttle" : "throttle");
-        } else {
-            LeafConfig.LOGGER.info("Redstone limiter: recovered world={}, chunk=[{}, {}], mode={}",
-                this.worldName, ChunkPos.getX(state.chunkKey), ChunkPos.getZ(state.chunkKey),
-                RedstoneLimiter.monitorOnly ? "monitor" : "throttle");
+        this.loggedStart = true;
+        LeafConfig.LOGGER.warn("Redstone limiter: world={}, MSPT={} ms reached the threshold of {} ms, mode={}",
+            this.worldName, this.msptEma, RedstoneLimiter.msptThreshold, RedstoneLimiter.monitorOnly ? "would slow down" : "slow down");
+    }
+
+    private void logEnd() {
+        if (this.loggedStart && RedstoneLimiter.logWarnings) {
+            LeafConfig.LOGGER.info("Redstone limiter: recovered world={}, MSPT={} ms, mode={}",
+                this.worldName, this.msptEma, RedstoneLimiter.monitorOnly ? "monitor" : "slow down");
         }
-    }
-
-    private static boolean validChunkBudget() {
-        return RedstoneLimiter.chunkBudgetMs > 0.0 && Double.isFinite(RedstoneLimiter.chunkBudgetMs);
-    }
-
-    private static long allowanceNanos() {
-        double budget = RedstoneLimiter.groupBudgetMs;
-        // Bound even direct runtime assignments: cap, floor and refill must not overflow.
-        return Double.isFinite(budget) ? Math.max(1L, (long) (Math.clamp(budget, 0.0, 50.0) * 1_000_000.0)) : 2_000_000L;
+        this.loggedStart = false;
     }
 
     private static boolean validCoordinate(long coordinate) {
@@ -868,21 +759,9 @@ public final class RedstoneLimiterManager {
     }
 
     private static final class Group {
-        private long balanceNanos;
-        private double avgCostNanos = 4000.0;
-        private long admittedEstimateNanos;
-        private long lastRejected;
-        // virtual time
         private long lag;
         private double phase;
         private boolean skip;
-        private double avgRunNanos = 4000.0;
-        private long spentNanos;
-
-        private Group(long allowance, long gameTime) {
-            this.balanceNanos = allowance;
-            this.lastRejected = gameTime;
-        }
     }
 
     private static final class ChunkState {
@@ -891,12 +770,7 @@ public final class RedstoneLimiterManager {
         private double emaMs;
         private long lastUpdate;
         private long lastActivity;
-        private long enteredAt;
-        private long lastHeld; // last time the limiter held back work of this chunk
-        private double savedRunNanos; // virtual time: cost per executed tick of the group the chunk was released from
-        private long savedAt;
         private boolean hasUpdate;
-        private boolean hot;
         private boolean queued;
         private ChunkState previous;
         private ChunkState next;
