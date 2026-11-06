@@ -18,7 +18,6 @@ public class RedstoneLimiter extends ConfigModule {
     public static double minSpeed = 0.1;
     public static String scope = "all";
     public static boolean hottestScope = false;
-    public static double hottestShare = 0.5;
     public static boolean slowBlockEntities = true;
     public static int neighborRadius = 1;
     public static int emaWindowTicks = 20;
@@ -32,9 +31,10 @@ public class RedstoneLimiter extends ConfigModule {
         globalConfig.addCommentRegionBased(basePath(), """
                 Virtual chunk time (experimental). Everything runs normally until the tick time (MSPT) of the server reaches mspt-threshold
                 and stays there for about a second. Then all chunks with recent scheduled block ticks (plus their neighbors) are grouped, and
-                every group gets its own clock that runs slower than the server (like /tick rate for just that area). The speed is the same
-                for all groups and is lowered step by step while the MSPT is above the threshold and raised again once it has fallen below
-                the recovery limit. When it is back at normal speed the groups are dissolved and everything runs normally again.
+                every group gets its own clock that runs slower than the server (like /tick rate for just that area). With scope "all" the speed
+                is the same for all groups, with scope "hottest" the most expensive group is slowed first and the next one only starts when
+                the previous one is at min-speed. The speed is lowered step by step while the MSPT is above the threshold and raised again
+                once it has fallen below the recovery limit. When it is back at normal speed the groups are dissolved and everything runs normally again.
                 A group runs only some server ticks (a whole group tick is skipped, nothing partial, the skipping is slightly irregular on purpose)
                 and all delays of scheduled block ticks inside it are measured in the group's own time, so repeaters, torches, observers etc.
                 stay in sync with each other and just run at a lower speed. Piston block events are slowed with it, and so are block entities
@@ -45,7 +45,7 @@ public class RedstoneLimiter extends ConfigModule {
             """
                 虚拟区块时间 (实验性). 在服务器的 Tick 耗时 (MSPT) 达到 mspt-threshold 并持续约一秒之前, 一切正常运行.
                 达到后, 所有最近有计划方块刻的区块 (及其相邻区块) 会被分组, 每组拥有自己的时钟, 运行速度低于服务器 (类似仅对该区域生效的 /tick rate).
-                所有组使用相同的速度: MSPT 高于阈值时逐步降低, 回落到恢复线以下后再逐步恢复. 恢复到正常速度后分组解散, 一切恢复正常.
+                scope "all" 时所有组使用相同的速度, scope "hottest" 时最耗时的组先减速, 到达 min-speed 后才轮到下一个组. MSPT 高于阈值时逐步降低, 回落到恢复线以下后再逐步恢复. 恢复到正常速度后分组解散, 一切恢复正常.
                 组只在部分服务器 Tick 中运行 (整组跳过一个 Tick, 不做部分执行, 跳过的节奏刻意带有轻微的不规则性),
                 组内计划方块刻的所有延迟按组自己的时间计算, 因此中继器, 红石火把, 侦测器等保持彼此同步, 只是整体变慢.
                 活塞方块事件随之减速, 开启 slow-block-entities 时方块实体也会减速. 实体, 流体, 随机刻以及其他不属于计划方块刻, 活塞事件或方块实体的内容不会被减速 (水机械保持原速).
@@ -101,23 +101,18 @@ public class RedstoneLimiter extends ConfigModule {
             globalConfig.pickStringRegionBased(
                 """
                 What is slowed down: "all" = all chunks with recent scheduled block ticks (plus neighbors), all at the same common speed,
-                connected chunks share one clock (most even, but harmless machines are slowed too). "hottest" = only the most expensive
-                chunks (together hottest-share of the redstone cost, plus neighbors) are slowed, cheap machines keep running normally.""",
+                connected chunks share one clock (most even, but harmless machines are slowed too). "hottest" = region by region: the most
+                expensive region (group of connected chunks) is slowed first, down to min-speed. Only if the MSPT is still above mspt-threshold
+                then, the second most expensive region starts to slow down, then the third, and so on. When the MSPT has recovered the regions
+                are released in the reverse order, cheap machines are only touched if needed.""",
                 """
                 减速范围: "all" = 所有最近有计划方块刻的区块 (及其相邻区块) 以相同的共同速度运行, 相连区块共用一个时钟 (最均匀, 但无害的机械也会被减速).
-                "hottest" = 仅减速最耗时的区块 (合计占红石耗时的 hottest-share, 及其相邻区块), 廉价的机械保持正常运行."""
+                "hottest" = 逐区域减速: 先把最耗时的区域 (相连区块组) 减速到 min-speed. 如果此时 MSPT 仍高于 mspt-threshold,
+                则第二耗时的区域开始减速, 然后是第三个, 依此类推. MSPT 恢复后按相反顺序释放这些区域, 廉价的机械只在必要时才会受影响."""
             )
         );
         String scopeName = scope == null ? "" : scope.trim();
         hottestScope = "hottest".equalsIgnoreCase(scopeName);
-
-        double loadedShare = globalConfig.getDouble(basePath() + ".hottest-share", hottestShare,
-            globalConfig.pickStringRegionBased(
-                "Only for scope \"hottest\": the most expensive chunks are slowed until they make up this share of the total redstone cost. Range: [0.1, 1.0].",
-                "仅用于 scope \"hottest\": 减速最耗时的区块, 直到它们占红石总耗时的该比例. 范围: [0.1, 1.0]."
-            )
-        );
-        hottestShare = Double.isFinite(loadedShare) ? Math.clamp(loadedShare, 0.1, 1.0) : 0.5;
 
         slowBlockEntities = globalConfig.getBoolean(basePath() + ".slow-block-entities", slowBlockEntities,
             globalConfig.pickStringRegionBased(

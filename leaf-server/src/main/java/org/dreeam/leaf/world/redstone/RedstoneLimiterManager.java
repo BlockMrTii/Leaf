@@ -17,8 +17,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * published statistics may be read from other threads.
  * <p>
  * As long as the smoothed MSPT stays below the threshold nothing is changed. Above it, all chunks with recent scheduled block ticks
- * (plus their neighbours) are grouped by connectivity, and every group gets its own clock that runs at one common speed. That speed is
- * lowered step by step while the MSPT is above the threshold and raised again once it is below the recovery limit.
+ * (plus their neighbours) are grouped by connectivity, and every group gets its own clock. Scope "all": all groups run at one common
+ * speed, lowered step by step while the MSPT is above the threshold and raised again once it is below the recovery limit. Scope
+ * "hottest": every group has a speed of its own; the most expensive group is slowed first, down to min-speed, and only if the MSPT is
+ * still above the threshold the next most expensive group is slowed, and so on. On recovery the groups are released in reverse order.
  * <p>
  * A chunk's own clock is the server tick minus its lag. Only chunks inside a group have a lag; a chunk that leaves its group is moved
  * back to the server clock at once (its pending ticks are shifted, the remaining delays stay the same), so nothing has to catch up.
@@ -87,7 +89,6 @@ public final class RedstoneLimiterManager {
     private final LongOpenHashSet remaining = new LongOpenHashSet();
     // Frozen zones: chunks whose group stands still completely until a redstone update reaches them (see updateFreeze)
     private final LongOpenHashSet frozenChunks = new LongOpenHashSet();
-    private final java.util.ArrayList<ChunkState> seedScratch = new java.util.ArrayList<>();
     private int playerActions; // nesting of player actions inside the level tick (digging in the player tick)
     private boolean inLevelTick; // between beginTick and endTick of the world: updates from machines, entities and clocks happen here
     private int freezeTimer; // consecutive ticks the smoothed MSPT stayed at or above the threshold while throttling
@@ -104,6 +105,7 @@ public final class RedstoneLimiterManager {
     private boolean groupsDirty;
     private int groupRadius = -1;
     private boolean wasVirtual;
+    private boolean wasCascade; // scope of the last controller step, to carry the speed over when it is switched
     // MSPT controller
     private long lastServerSeq;
     private double msptEma;
@@ -380,11 +382,30 @@ public final class RedstoneLimiterManager {
     }
 
     /**
-     * Starts the slowdown when the smoothed MSPT reaches the threshold. While it is above, the common speed falls (faster the larger
-     * the overload), between the recovery limit and the threshold it is held, below the recovery limit it rises until real time is
-     * reached and the groups are released.
+     * Starts the slowdown when the smoothed MSPT reaches the threshold. While it is above, the speed falls (faster the larger the
+     * overload; scope "all": the common speed, scope "hottest": the speed of the most expensive group that is not at min-speed yet),
+     * between the recovery limit and the threshold it is held, below the recovery limit it rises until real time is reached and the
+     * groups are released.
      */
+    /** Carries the speed over when the scope was switched (config reload); called before the first clock decision with the new scope. */
+    private void syncScope() {
+        final boolean cascade = RedstoneLimiter.hottestScope;
+        if (cascade != this.wasCascade) {
+            this.wasCascade = cascade;
+            if (cascade) {
+                // "all" -> "hottest": the groups take over the common speed, otherwise they would all run at full speed at once
+                final double common = Math.clamp(this.speed, minSpeed(), 1.0);
+                for (int i = 0; i < this.groups.size(); ++i) {
+                    this.groups.get(i).speed = common;
+                }
+            } else {
+                this.updateLowestSpeed(); // "hottest" -> "all": the slowest group sets the common speed
+            }
+        }
+    }
+
     private void updateController(long gameTime) {
+        this.syncScope();
         double threshold = RedstoneLimiter.msptThreshold;
         double recovery = Double.isFinite(RedstoneLimiter.msptRecoveryRatio) ? Math.clamp(RedstoneLimiter.msptRecoveryRatio, 0.5, 0.99) : 0.9;
         if (minSpeed() >= 1.0) {
@@ -405,10 +426,21 @@ public final class RedstoneLimiterManager {
                 this.logStart(gameTime);
             }
             double overload = Math.min(1.0, this.msptEma / threshold - 1.0);
-            this.speed = Math.max(minSpeed(), this.speed - SPEED_STEP_DOWN * (1.0 + 4.0 * overload));
+            double step = SPEED_STEP_DOWN * (1.0 + 4.0 * overload);
+            if (RedstoneLimiter.hottestScope) {
+                this.cascadeDown(step);
+            } else {
+                this.speed = Math.max(minSpeed(), this.speed - step);
+            }
         } else {
             this.overTicks = 0;
             if (this.throttling) {
+                if (RedstoneLimiter.hottestScope) {
+                    if (this.cascadeUp(this.msptEma < threshold * recovery)) {
+                        this.release();
+                    }
+                    return;
+                }
                 this.speed = Math.max(minSpeed(), this.speed); // a raised min-speed (config reload) takes effect right away
                 if (this.msptEma < threshold * recovery) {
                     this.speed = Math.min(1.0, this.speed + SPEED_STEP_UP);
@@ -418,6 +450,95 @@ public final class RedstoneLimiterManager {
                 }
             }
         }
+    }
+
+    /**
+     * Scope "hottest", MSPT above the threshold: slows the most expensive group that is not at min-speed yet by one step. A group that
+     * is already on its way down continues first (the slowest of them), whatever its smoothed cost does meanwhile, because the costs
+     * of slowed and unslowed groups are not comparable. Only when it has reached min-speed the next most expensive group starts, which
+     * is the threshold between the regions. Frozen groups are left alone.
+     */
+    private void cascadeDown(double step) {
+        final double min = minSpeed();
+        Group target = null;
+        boolean targetSlowed = false;
+        double best = 0.0; // a group without measured cost is not worth slowing
+        for (int i = 0; i < this.groups.size(); ++i) {
+            Group group = this.groups.get(i);
+            if (group.frozen) {
+                continue;
+            }
+            group.speed = Math.clamp(group.speed, min, 1.0); // a raised min-speed (config reload) takes effect right away
+            if (group.speed <= min) {
+                continue;
+            }
+            if (group.speed < 1.0) {
+                // a group that is already on its way down continues first (the slowest of them), whatever its smoothed cost does in the meantime
+                if (!targetSlowed || group.speed < target.speed) {
+                    target = group;
+                    targetSlowed = true;
+                }
+            } else if (!targetSlowed) {
+                double rank = group.cost;
+                if (rank > best) {
+                    best = rank;
+                    target = group;
+                }
+            }
+        }
+        if (target != null) {
+            target.speed = Math.max(min, target.speed - step);
+        }
+        this.updateLowestSpeed();
+    }
+
+    /**
+     * Scope "hottest", MSPT below the threshold: while it is below the recovery limit the cheapest slowed group is raised by one step,
+     * so the groups are released in the reverse order of the slowdown. Returns true once no group is slowed any more (end of the slowdown).
+     */
+    private boolean cascadeUp(boolean recovering) {
+        final double min = minSpeed();
+        Group target = null;
+        double bestSpeed = -1.0;
+        double bestCost = Double.MAX_VALUE;
+        for (int i = 0; i < this.groups.size(); ++i) {
+            Group group = this.groups.get(i);
+            if (group.frozen) {
+                continue;
+            }
+            group.speed = Math.clamp(group.speed, min, 1.0);
+            if (group.speed >= 1.0) {
+                continue;
+            }
+            // the group that is on its way up continues first (the fastest slowed one), otherwise the cheapest one at min-speed starts
+            double cost = group.cost / group.speed;
+            if (group.speed > bestSpeed || (group.speed == bestSpeed && cost < bestCost)) {
+                bestSpeed = group.speed;
+                bestCost = cost;
+                target = group;
+            }
+        }
+        if (target == null) {
+            return true; // nothing is slowed, so nothing is held: the slowdown ends even if the MSPT is still in the band below the threshold
+        }
+        if (recovering) {
+            target.speed = Math.min(1.0, target.speed + SPEED_STEP_UP);
+        }
+        this.updateLowestSpeed();
+        return false;
+    }
+
+    /** Scope "hottest": the common speed field shows the slowest group (statistics, activity window). */
+    private void updateLowestSpeed() {
+        final double min = minSpeed();
+        double lowest = 1.0;
+        for (int i = 0; i < this.groups.size(); ++i) {
+            Group group = this.groups.get(i);
+            if (!group.frozen) {
+                lowest = Math.min(lowest, Math.clamp(group.speed, min, 1.0));
+            }
+        }
+        this.speed = lowest;
     }
 
     /** End of the slowdown: the groups are dissolved by the next rebuild and every chunk goes back to the server clock. */
@@ -472,7 +593,19 @@ public final class RedstoneLimiterManager {
                 }
             }
         }
-        this.publishedStats = new Stats(true, this.throttling, this.msptEma, this.speed, this.worldEmaMs, active, this.memberGroup.size(),
+        int throttled = this.memberGroup.size();
+        if (RedstoneLimiter.hottestScope) {
+            // scope "hottest": only the chunks of groups that are really slowed (the others are just grouped and run at full speed)
+            throttled = 0;
+            var members = this.memberGroup.values().iterator();
+            while (members.hasNext()) {
+                Group member = members.next();
+                if (member.speed < 1.0 && !member.frozen) {
+                    ++throttled;
+                }
+            }
+        }
+        this.publishedStats = new Stats(true, this.throttling, this.msptEma, this.speed, this.worldEmaMs, active, throttled,
             this.groups.size(), hasHottest, ChunkPos.getX(hottestChunk), ChunkPos.getZ(hottestChunk), hottestMs, this.frozenChunks.size());
     }
 
@@ -529,10 +662,18 @@ public final class RedstoneLimiterManager {
         }
         Group hottest = null;
         double hottestCost = 0.0;
+        final boolean cascade = RedstoneLimiter.hottestScope;
         for (var cost : costs.entrySet()) {
-            if (cost.getValue()[0] > hottestCost) {
-                hottest = cost.getKey();
-                hottestCost = cost.getValue()[0];
+            Group candidate = cost.getKey();
+            double candidateCost = cost.getValue()[0];
+            // scope "hottest": the cascade slowed the most expensive group first, so the slowest one is the hottest (the smoothed costs of
+            // slowed and unslowed groups are not comparable, a slowed group runs only every n-th tick); ties go to the higher cost
+            boolean better = cascade
+                ? hottest == null || candidate.speed < hottest.speed || (candidate.speed == hottest.speed && candidateCost > hottestCost)
+                : candidateCost > hottestCost;
+            if (better) {
+                hottest = candidate;
+                hottestCost = candidateCost;
             }
         }
         if (hottest == null) {
@@ -623,7 +764,8 @@ public final class RedstoneLimiterManager {
     }
 
     /**
-     * Virtual time: decides for the NEXT server tick whether a group runs or is skipped. All groups share one speed; a fractional
+     * Virtual time: decides for the NEXT server tick whether a group runs or is skipped. Scope "all": all groups share one speed, scope
+     * "hottest": every group has its own; a fractional
      * accumulator spreads the skipped ticks evenly and each group starts at a phase of its own. A skipped tick adds one tick of lag
      * so the group's own clock (server tick minus lag) stands still.
      */
@@ -631,9 +773,14 @@ public final class RedstoneLimiterManager {
         boolean virtual = this.isVirtual();
         boolean skipping = false;
         boolean lagging = false;
+        this.syncScope();
+        final boolean cascade = RedstoneLimiter.hottestScope;
         double groupSpeed = Math.clamp(this.speed, minSpeed(), 1.0);
         for (int i = 0; i < this.groups.size(); ++i) {
             Group group = this.groups.get(i);
+            if (cascade) {
+                groupSpeed = Math.clamp(group.speed, minSpeed(), 1.0); // scope "hottest": every group has a speed of its own
+            }
             if (group.frozen) {
                 group.skip = true; // the clock of a frozen zone stands still, also after the slowdown ended
                 ++group.lag;
@@ -665,40 +812,11 @@ public final class RedstoneLimiterManager {
         if (virtual) {
             // every chunk with recent scheduled ticks (or held back work) is a seed, connected seeds form one group
             final long window = this.activityWindow();
-            if (RedstoneLimiter.hottestScope) {
-                // scope "hottest": only the most expensive active chunks (together hottest-share of the cost) are seeds
-                this.seedScratch.clear();
-                double total = 0.0;
-                var seeds = this.chunks.long2ObjectEntrySet().fastIterator();
-                while (seeds.hasNext()) {
-                    ChunkState seed = seeds.next().getValue();
-                    if (elapsed(gameTime, seed.lastActivity) <= window && !this.frozenChunks.contains(seed.chunkKey)) { // frozen chunks are added below and use no budget
-                        // chunks that are already slowed run only every n-th tick, their average falls against the chunks that run every tick:
-                        // their cost is scaled up by the slowdown, which keeps them in the selection, otherwise equally expensive machines would swap between the clocks
-                        seed.rank = this.memberGroup.containsKey(seed.chunkKey) ? seed.emaMs / Math.clamp(this.speed, minSpeed(), 1.0) : seed.emaMs;
-                        this.seedScratch.add(seed);
-                        total += seed.emaMs;
-                    }
-                }
-                this.seedScratch.sort((a, b) -> Double.compare(b.rank, a.rank));
-                double target = total * Math.clamp(RedstoneLimiter.hottestShare, 0.1, 1.0);
-                double accumulated = 0.0;
-                for (int i = 0; i < this.seedScratch.size(); ++i) {
-                    ChunkState seed = this.seedScratch.get(i);
-                    if (accumulated >= target && accumulated > 0.0) {
-                        break;
-                    }
+            var seeds = this.chunks.long2ObjectEntrySet().fastIterator();
+            while (seeds.hasNext()) {
+                ChunkState seed = seeds.next().getValue();
+                if (elapsed(gameTime, seed.lastActivity) <= window && !this.frozenChunks.contains(seed.chunkKey)) { // frozen chunks are added below
                     this.addNeighbors(seed.chunkKey, this.groupRadius);
-                    accumulated += seed.emaMs;
-                }
-                this.seedScratch.clear();
-            } else {
-                var seeds = this.chunks.long2ObjectEntrySet().fastIterator();
-                while (seeds.hasNext()) {
-                    ChunkState seed = seeds.next().getValue();
-                    if (elapsed(gameTime, seed.lastActivity) <= window && !this.frozenChunks.contains(seed.chunkKey)) { // frozen chunks are added below
-                        this.addNeighbors(seed.chunkKey, this.groupRadius);
-                    }
                 }
             }
             if (!this.coupledUntil.isEmpty()) {
@@ -723,6 +841,7 @@ public final class RedstoneLimiterManager {
             }
         }
         this.lastGroupRebuild = gameTime;
+        final boolean hottest = RedstoneLimiter.hottestScope;
         Long2ObjectOpenHashMap<Group> replacement = this.memberSpare; // reused, no allocation per rebuild
         replacement.clear();
         this.groups.clear();
@@ -745,6 +864,15 @@ public final class RedstoneLimiterManager {
                 // the chunk's pending ticks are shifted by the difference afterwards (remaining own ticks stay the same)
                 Group previous = this.memberGroup.get(key);
                 long ownLag = previous != null ? previous.lag : 0L; // outside of a group a chunk is on the server clock
+                if (previous != null) {
+                    group.speed = Math.min(group.speed, previous.speed); // a group keeps the slowest speed of its members (scope "hottest")
+                }
+                if (hottest) {
+                    ChunkState costState = this.chunks.get(key);
+                    if (costState != null) {
+                        group.cost += costState.emaMs;
+                    }
+                }
                 this.shiftScratch.add(key);
                 this.shiftScratch.add(ownLag);
                 group.lag = Math.max(group.lag, ownLag);
@@ -798,6 +926,9 @@ public final class RedstoneLimiterManager {
         }
         this.hasLag = lagging;
         this.queue.clear();
+        if (hottest) {
+            this.updateLowestSpeed();
+        }
     }
 
     /**
@@ -912,6 +1043,7 @@ public final class RedstoneLimiterManager {
         this.pending = null;
         this.groupsDirty = false;
         this.wasVirtual = false;
+        this.wasCascade = false;
         this.coupledUntil.clear();
         this.frozenChunks.clear();
         this.freezeTimer = 0;
@@ -992,13 +1124,14 @@ public final class RedstoneLimiterManager {
         private double phase;
         private boolean skip;
         private boolean frozen; // stands still completely, independent of the speed (see updateFreeze)
+        private double speed = 1.0; // scope "hottest": speed of this group, 1.0 = real time
+        private double cost; // scope "hottest": summed smoothed cost of the members at the last rebuild
     }
 
     private static final class ChunkState {
         private final long chunkKey;
         private long tickNanos;
         private double emaMs;
-        private double rank; // scratch value of the scope "hottest" selection
         private long lastUpdate;
         private long lastActivity;
         private boolean hasUpdate;
