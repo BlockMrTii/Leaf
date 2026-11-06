@@ -182,6 +182,8 @@ public final class RedstoneBarTask {
             .append(Component.text(String.format(Locale.ROOT, "%.2f", stats.redstoneMs()), NamedTextColor.WHITE))
             .append(Component.text(" CH: ", NamedTextColor.GRAY))
             .append(Component.text(chunks, gradient(chunks / CHUNKS_FOR_RED)))
+            .append(Component.text(stats.frozenChunks() > 0 ? " FRZ: " : "", NamedTextColor.GRAY))
+            .append(Component.text(stats.frozenChunks() > 0 ? String.valueOf(stats.frozenChunks()) : "", RED))
             .append(Component.text(" TOP: ", NamedTextColor.GRAY))
             .append(top)
             .build());

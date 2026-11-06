@@ -16,9 +16,14 @@ public class RedstoneLimiter extends ConfigModule {
     public static double msptThreshold = 50.0;
     public static double msptRecoveryRatio = 0.9;
     public static double minSpeed = 0.1;
+    public static String scope = "all";
+    public static boolean hottestScope = false;
+    public static double hottestShare = 0.5;
     public static boolean slowBlockEntities = true;
     public static int neighborRadius = 1;
     public static int emaWindowTicks = 20;
+    public static boolean freezeEnabled = false;
+    public static int freezeAfterSeconds = 60;
     public static boolean logWarnings = true;
     public static int logIntervalTicks = 1200;
 
@@ -92,6 +97,28 @@ public class RedstoneLimiter extends ConfigModule {
         );
         minSpeed = Double.isFinite(loadedMinSpeed) ? Math.clamp(loadedMinSpeed, 0.02, 1.0) : 0.1;
 
+        scope = globalConfig.getString(basePath() + ".scope", scope,
+            globalConfig.pickStringRegionBased(
+                """
+                What is slowed down: "all" = all chunks with recent scheduled block ticks (plus neighbors), all at the same common speed,
+                connected chunks share one clock (most even, but harmless machines are slowed too). "hottest" = only the most expensive
+                chunks (together hottest-share of the redstone cost, plus neighbors) are slowed, cheap machines keep running normally.""",
+                """
+                减速范围: "all" = 所有最近有计划方块刻的区块 (及其相邻区块) 以相同的共同速度运行, 相连区块共用一个时钟 (最均匀, 但无害的机械也会被减速).
+                "hottest" = 仅减速最耗时的区块 (合计占红石耗时的 hottest-share, 及其相邻区块), 廉价的机械保持正常运行."""
+            )
+        );
+        String scopeName = scope == null ? "" : scope.trim();
+        hottestScope = "hottest".equalsIgnoreCase(scopeName);
+
+        double loadedShare = globalConfig.getDouble(basePath() + ".hottest-share", hottestShare,
+            globalConfig.pickStringRegionBased(
+                "Only for scope \"hottest\": the most expensive chunks are slowed until they make up this share of the total redstone cost. Range: [0.1, 1.0].",
+                "仅用于 scope \"hottest\": 减速最耗时的区块, 直到它们占红石总耗时的该比例. 范围: [0.1, 1.0]."
+            )
+        );
+        hottestShare = Double.isFinite(loadedShare) ? Math.clamp(loadedShare, 0.1, 1.0) : 0.5;
+
         slowBlockEntities = globalConfig.getBoolean(basePath() + ".slow-block-entities", slowBlockEntities,
             globalConfig.pickStringRegionBased(
                 "Block entities (pistons in motion, hoppers, furnaces, ...) of a slowed group also only tick on the group's ticks.",
@@ -121,6 +148,28 @@ public class RedstoneLimiter extends ConfigModule {
                 窗口小则反应快但不稳定, 窗口大则忽略短暂的卡顿尖峰. 范围: [1, 1200]."""
             )
         ), 1, 1200);
+
+        freezeEnabled = globalConfig.getBoolean(basePath() + ".freeze-enabled", freezeEnabled,
+            globalConfig.pickStringRegionBased(
+                """
+                Freeze zones that keep the server overloaded: if the slowdown cannot bring the MSPT below mspt-threshold within
+                freeze-after-seconds, the most expensive zone (group of chunks) is stopped completely (scheduled ticks, pistons and, with
+                slow-block-entities, block entities). A frozen zone stays frozen, even after the slowdown ended, until a redstone update
+                (a lever, button, redstone block, ... next to it) is switched or placed by a player, a command or a plugin (updates from
+                clocks, minecarts and mobs during the tick do not thaw). Has no effect in monitor-only mode.""",
+                """
+                冻结持续使服务器过载的区域: 如果减速在 freeze-after-seconds 内无法使 MSPT 降到 mspt-threshold 以下,
+                则完全停止最耗时的区域 (区块组) (计划方块刻, 活塞, 以及开启 slow-block-entities 时的方块实体).
+                被冻结的区域会一直保持冻结 (即使减速已结束), 直到红石更新 (旁边的拉杆, 按钮, 红石块等) 触及其中一个区块.
+                仅监控模式下无效."""
+            )
+        );
+        freezeAfterSeconds = Math.clamp(globalConfig.getInt(basePath() + ".freeze-after-seconds", freezeAfterSeconds,
+            globalConfig.pickStringRegionBased(
+                "Seconds the MSPT must stay above mspt-threshold while slowed down before the most expensive zone is frozen. Range: [5, 3600].",
+                "在减速状态下 MSPT 持续高于 mspt-threshold 多少秒后冻结最耗时的区域. 范围: [5, 3600]."
+            )
+        ), 5, 3600);
 
         logWarnings = globalConfig.getBoolean(basePath() + ".log-warnings", logWarnings,
             globalConfig.pickStringRegionBased(

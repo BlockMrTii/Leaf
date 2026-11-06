@@ -64,9 +64,10 @@ public final class RedstoneLimiterManager {
         boolean hasHottest,
         int hottestChunkX,
         int hottestChunkZ,
-        double hottestMs
+        double hottestMs,
+        int frozenChunks
     ) {
-        public static final Stats EMPTY = new Stats(false, false, 0.0, 1.0, 0.0, 0, 0, 0, false, 0, 0, 0.0);
+        public static final Stats EMPTY = new Stats(false, false, 0.0, 1.0, 0.0, 0, 0, 0, false, 0, 0, 0.0, 0);
     }
 
     private volatile Stats publishedStats = Stats.EMPTY;
@@ -84,6 +85,12 @@ public final class RedstoneLimiterManager {
     private static final int START_DELAY_TICKS = 20; // the smoothed MSPT must stay above the threshold this long, a single freeze (GC) must not start the slowdown
     private static final double SPEED_JITTER = 0.1; // +-10% on the speed of every group tick: an exactly periodic skip pattern would starve block entities that act on gameTime % N
     private final LongOpenHashSet remaining = new LongOpenHashSet();
+    // Frozen zones: chunks whose group stands still completely until a redstone update reaches them (see updateFreeze)
+    private final LongOpenHashSet frozenChunks = new LongOpenHashSet();
+    private final java.util.ArrayList<ChunkState> seedScratch = new java.util.ArrayList<>();
+    private int playerActions; // nesting of player actions inside the level tick (digging in the player tick)
+    private boolean inLevelTick; // between beginTick and endTick of the world: updates from machines, entities and clocks happen here
+    private int freezeTimer; // consecutive ticks the smoothed MSPT stayed at or above the threshold while throttling
     private final LongArrayList queue = new LongArrayList();
     private Long2ObjectOpenHashMap<Group> memberSpare = new Long2ObjectOpenHashMap<>();
     private long lastGroupRebuild;
@@ -112,6 +119,7 @@ public final class RedstoneLimiterManager {
     private boolean tickSlowBlockEntities; // slow-block-entities as of the start of this tick, so all decisions of one tick agree
     private final Long2LongOpenHashMap coupledUntil = new Long2LongOpenHashMap(); // chunks of a moved structure, kept as group members until then
     private Long2LongOpenHashMap pendingShift = new Long2LongOpenHashMap();
+    private Long2LongOpenHashMap pendingFluidShift = new Long2LongOpenHashMap(); // the fluid tick scheduler is a second consumer of the same shifts
     private final LongArrayList shiftScratch = new LongArrayList();
     private boolean anySkipping;
     private long currentTick;
@@ -145,12 +153,31 @@ public final class RedstoneLimiterManager {
      */
     public void beginTick() {
         this.tickSlowBlockEntities = RedstoneLimiter.slowBlockEntities;
+        this.inLevelTick = true;
         this.advanceVirtualClocks();
     }
 
     /** Trigger tick shifts (chunk key to delta) that follow a lag change of chunks, applied by the scheduled tick code. */
     public boolean hasPendingShifts() {
         return !this.pendingShift.isEmpty();
+    }
+
+    public boolean hasPendingFluidShifts() {
+        return !this.pendingFluidShift.isEmpty();
+    }
+
+    private void addShift(long chunkKey, long delta) {
+        this.pendingShift.addTo(chunkKey, delta);
+        this.pendingFluidShift.addTo(chunkKey, delta);
+    }
+
+    public @Nullable Long2LongOpenHashMap takeFluidShifts() {
+        if (this.pendingFluidShift.isEmpty()) {
+            return null;
+        }
+        Long2LongOpenHashMap out = this.pendingFluidShift;
+        this.pendingFluidShift = new Long2LongOpenHashMap();
+        return out;
     }
 
     public @Nullable Long2LongOpenHashMap takeShifts() {
@@ -255,6 +282,7 @@ public final class RedstoneLimiterManager {
 
     public void endTick(long gameTime) {
         RedstoneBarTask.ensureStarted();
+        this.inLevelTick = false;
         this.currentTick = gameTime == Long.MAX_VALUE ? Long.MAX_VALUE : gameTime + 1;
         if (!RedstoneLimiter.enabled) {
             this.clearTracking();
@@ -263,6 +291,7 @@ public final class RedstoneLimiterManager {
         this.tracking = true;
         this.updateMspt();
         this.updateController(gameTime);
+        this.updateFreeze(gameTime);
         boolean virtual = this.isVirtual();
         // virtual time runs a group in 1 of N ticks, the cost per server tick is bursty (full tick, then nothing) with a period of up
         // to 1/minSpeed ticks, so the displayed load needs a window that covers several periods
@@ -282,7 +311,7 @@ public final class RedstoneLimiterManager {
         while (state != null) {
             ChunkState next = state.next;
             // virtual time: a tick the chunk's group skips has no cost by design, so it must not enter the average
-            Group chunkGroup = virtual ? this.memberGroup.get(state.chunkKey) : null;
+            Group chunkGroup = virtual || !this.frozenChunks.isEmpty() ? this.memberGroup.get(state.chunkKey) : null;
             if (chunkGroup != null && chunkGroup.skip) {
                 state.tickNanos = 0;
                 state.lastUpdate = gameTime;
@@ -322,7 +351,7 @@ public final class RedstoneLimiterManager {
             var iterator = this.chunks.long2ObjectEntrySet().fastIterator();
             while (iterator.hasNext()) {
                 ChunkState candidate = iterator.next().getValue();
-                if (!candidate.queued && elapsed(gameTime, candidate.lastActivity) >= retention) {
+                if (!candidate.queued && elapsed(gameTime, candidate.lastActivity) >= retention && !this.frozenChunks.contains(candidate.chunkKey)) {
                     iterator.remove();
                 }
             }
@@ -434,7 +463,7 @@ public final class RedstoneLimiterManager {
         var iterator = this.chunks.long2ObjectEntrySet().fastIterator();
         while (iterator.hasNext()) {
             ChunkState candidate = iterator.next().getValue();
-            if (elapsed(gameTime, candidate.lastActivity) <= window) {
+            if (elapsed(gameTime, candidate.lastActivity) <= window && !this.frozenChunks.contains(candidate.chunkKey)) { // a frozen chunk is not running, it is shown as FRZ
                 ++active;
                 if (candidate.emaMs > hottestMs) {
                     hasHottest = true;
@@ -444,7 +473,153 @@ public final class RedstoneLimiterManager {
             }
         }
         this.publishedStats = new Stats(true, this.throttling, this.msptEma, this.speed, this.worldEmaMs, active, this.memberGroup.size(),
-            this.groups.size(), hasHottest, ChunkPos.getX(hottestChunk), ChunkPos.getZ(hottestChunk), hottestMs);
+            this.groups.size(), hasHottest, ChunkPos.getX(hottestChunk), ChunkPos.getZ(hottestChunk), hottestMs, this.frozenChunks.size());
+    }
+
+    private static boolean freezeActive() {
+        return RedstoneLimiter.enabled && !RedstoneLimiter.monitorOnly && RedstoneLimiter.freezeEnabled && minSpeed() < 1.0;
+    }
+
+    /**
+     * Freezing: when the slowdown cannot relieve the server (the smoothed MSPT stays at or above the threshold for freeze-after-seconds
+     * while throttling), the hottest group is stopped completely. The timer then starts again, so the next zone is only frozen if the
+     * server is still overloaded after another period. A frozen zone stays frozen even after the slowdown ended, until a redstone
+     * update reaches one of its chunks ({@link #onNeighborUpdate}).
+     */
+    private void updateFreeze(long gameTime) {
+        if (!freezeActive()) {
+            this.freezeTimer = 0;
+            if (!this.frozenChunks.isEmpty()) {
+                this.frozenChunks.clear(); // switched off (or limiter off): the next rebuild lets the zones run on their normal clock
+                this.groupsDirty = true;
+            }
+            return;
+        }
+        if (!this.throttling) {
+            this.freezeTimer = 0;
+            return;
+        }
+        if (this.msptEma >= RedstoneLimiter.msptThreshold) {
+            if (++this.freezeTimer >= Math.max(1, RedstoneLimiter.freezeAfterSeconds) * 20) {
+                this.freezeTimer = 0;
+                this.freezeHottestGroup(gameTime);
+            }
+        } else {
+            this.freezeTimer = 0; // only an uninterrupted overload freezes a zone
+        }
+    }
+
+    private void freezeHottestGroup(long gameTime) {
+        if (this.groups.isEmpty()) {
+            return;
+        }
+        // cost of a group = sum of the smoothed cost of its chunks (those that ran scheduled ticks lately)
+        var costs = new java.util.IdentityHashMap<Group, double[]>();
+        var members = this.memberGroup.long2ObjectEntrySet().fastIterator();
+        while (members.hasNext()) {
+            var entry = members.next();
+            Group group = entry.getValue();
+            if (group.frozen) {
+                continue;
+            }
+            ChunkState state = this.chunks.get(entry.getLongKey());
+            if (state != null) {
+                costs.computeIfAbsent(group, ignored -> new double[1])[0] += state.emaMs;
+            }
+        }
+        Group hottest = null;
+        double hottestCost = 0.0;
+        for (var cost : costs.entrySet()) {
+            if (cost.getValue()[0] > hottestCost) {
+                hottest = cost.getKey();
+                hottestCost = cost.getValue()[0];
+            }
+        }
+        if (hottest == null) {
+            return;
+        }
+        int count = 0;
+        long center = 0L;
+        double centerMs = -1.0;
+        members = this.memberGroup.long2ObjectEntrySet().fastIterator();
+        while (members.hasNext()) {
+            var entry = members.next();
+            if (entry.getValue() == hottest) {
+                this.frozenChunks.add(entry.getLongKey());
+                ++count;
+                ChunkState state = this.chunks.get(entry.getLongKey());
+                if (state != null && state.emaMs > centerMs) {
+                    centerMs = state.emaMs;
+                    center = entry.getLongKey();
+                }
+            }
+        }
+        hottest.frozen = true;
+        if (RedstoneLimiter.logWarnings) {
+            LeafConfig.LOGGER.warn("Redstone limiter: world={}, froze a zone of {} chunks around chunk [{}, {}] ({} ms), it runs again after a redstone update",
+                this.worldName, count, ChunkPos.getX(center), ChunkPos.getZ(center), hottestCost);
+        }
+    }
+
+    /**
+     * A redstone update (a block that is a signal source changed next to {@code pos}) thaws the frozen zone the position belongs to:
+     * a player flipping a lever or placing a redstone block, an observer or the like. The zone then runs again like every other
+     * group and can be frozen again after the next freeze period. Cheap while nothing is frozen.
+     */
+    public void onNeighborUpdate(net.minecraft.core.BlockPos pos, net.minecraft.world.level.block.Block source) {
+        // Only updates from outside the world tick thaw: a player's click on a lever or button, a block placed or broken, a command or a
+        // plugin. Updates during the tick come from clocks, minecarts or mobs and must not thaw a zone again right after it was frozen.
+        if ((this.inLevelTick && this.playerActions == 0) || this.frozenChunks.isEmpty() || !source.defaultBlockState().isSignalSource()) {
+            return;
+        }
+        // the update also reaches the neighbours of pos, which can lie in the next chunk
+        this.thaw(ChunkPos.pack(pos));
+        if (this.frozenChunks.isEmpty()) {
+            return;
+        }
+        final int x = pos.getX();
+        final int z = pos.getZ();
+        if ((x & 15) == 0) {
+            this.thaw(ChunkPos.pack((x - 1) >> 4, z >> 4));
+        } else if ((x & 15) == 15) {
+            this.thaw(ChunkPos.pack((x + 1) >> 4, z >> 4));
+        }
+        if ((z & 15) == 0) {
+            this.thaw(ChunkPos.pack(x >> 4, (z - 1) >> 4));
+        } else if ((z & 15) == 15) {
+            this.thaw(ChunkPos.pack(x >> 4, (z + 1) >> 4));
+        }
+    }
+
+    public void enterPlayerAction() {
+        ++this.playerActions;
+    }
+
+    public void leavePlayerAction() {
+        if (this.playerActions > 0) {
+            --this.playerActions;
+        }
+    }
+
+    private void thaw(long key) {
+        Group group = this.memberGroup.get(key);
+        if (group == null || !group.frozen) {
+            return;
+        }
+        group.frozen = false;
+        var members = this.memberGroup.long2ObjectEntrySet().fastIterator();
+        while (members.hasNext()) {
+            var entry = members.next();
+            if (entry.getValue() == group) {
+                this.frozenChunks.remove(entry.getLongKey());
+            }
+        }
+        this.freezeTimer = 0;
+        this.groupsDirty = true; // without the slowdown the zone's group is dissolved by the rebuild (its ticks return to the server clock)
+        if (RedstoneLimiter.logWarnings) {
+            LeafConfig.LOGGER.info("Redstone limiter: world={}, a redstone update at chunk [{}, {}] thawed a frozen zone",
+                this.worldName, ChunkPos.getX(key), ChunkPos.getZ(key));
+        }
     }
 
     /**
@@ -459,7 +634,11 @@ public final class RedstoneLimiterManager {
         double groupSpeed = Math.clamp(this.speed, minSpeed(), 1.0);
         for (int i = 0; i < this.groups.size(); ++i) {
             Group group = this.groups.get(i);
-            if (virtual) {
+            if (group.frozen) {
+                group.skip = true; // the clock of a frozen zone stands still, also after the slowdown ended
+                ++group.lag;
+                skipping = true;
+            } else if (virtual) {
                 // at full speed nothing is skipped, below it the speed is dithered (see SPEED_JITTER) so that the groups do not always
                 // run in the same residue of the game time
                 group.phase += groupSpeed >= 1.0 ? 1.0 : groupSpeed * this.nextJitter();
@@ -486,11 +665,40 @@ public final class RedstoneLimiterManager {
         if (virtual) {
             // every chunk with recent scheduled ticks (or held back work) is a seed, connected seeds form one group
             final long window = this.activityWindow();
-            var seeds = this.chunks.long2ObjectEntrySet().fastIterator();
-            while (seeds.hasNext()) {
-                ChunkState seed = seeds.next().getValue();
-                if (elapsed(gameTime, seed.lastActivity) <= window) {
+            if (RedstoneLimiter.hottestScope) {
+                // scope "hottest": only the most expensive active chunks (together hottest-share of the cost) are seeds
+                this.seedScratch.clear();
+                double total = 0.0;
+                var seeds = this.chunks.long2ObjectEntrySet().fastIterator();
+                while (seeds.hasNext()) {
+                    ChunkState seed = seeds.next().getValue();
+                    if (elapsed(gameTime, seed.lastActivity) <= window && !this.frozenChunks.contains(seed.chunkKey)) { // frozen chunks are added below and use no budget
+                        // chunks that are already slowed run only every n-th tick, their average falls against the chunks that run every tick:
+                        // their cost is scaled up by the slowdown, which keeps them in the selection, otherwise equally expensive machines would swap between the clocks
+                        seed.rank = this.memberGroup.containsKey(seed.chunkKey) ? seed.emaMs / Math.clamp(this.speed, minSpeed(), 1.0) : seed.emaMs;
+                        this.seedScratch.add(seed);
+                        total += seed.emaMs;
+                    }
+                }
+                this.seedScratch.sort((a, b) -> Double.compare(b.rank, a.rank));
+                double target = total * Math.clamp(RedstoneLimiter.hottestShare, 0.1, 1.0);
+                double accumulated = 0.0;
+                for (int i = 0; i < this.seedScratch.size(); ++i) {
+                    ChunkState seed = this.seedScratch.get(i);
+                    if (accumulated >= target && accumulated > 0.0) {
+                        break;
+                    }
                     this.addNeighbors(seed.chunkKey, this.groupRadius);
+                    accumulated += seed.emaMs;
+                }
+                this.seedScratch.clear();
+            } else {
+                var seeds = this.chunks.long2ObjectEntrySet().fastIterator();
+                while (seeds.hasNext()) {
+                    ChunkState seed = seeds.next().getValue();
+                    if (elapsed(gameTime, seed.lastActivity) <= window && !this.frozenChunks.contains(seed.chunkKey)) { // frozen chunks are added below
+                        this.addNeighbors(seed.chunkKey, this.groupRadius);
+                    }
                 }
             }
             if (!this.coupledUntil.isEmpty()) {
@@ -506,6 +714,13 @@ public final class RedstoneLimiterManager {
             }
         } else {
             this.coupledUntil.clear();
+        }
+        if (!this.frozenChunks.isEmpty()) {
+            // frozen zones are kept as they are, whether the slowdown is on or not
+            var frozen = this.frozenChunks.iterator();
+            while (frozen.hasNext()) {
+                this.remaining.add(frozen.nextLong());
+            }
         }
         this.lastGroupRebuild = gameTime;
         Long2ObjectOpenHashMap<Group> replacement = this.memberSpare; // reused, no allocation per rebuild
@@ -523,6 +738,9 @@ public final class RedstoneLimiterManager {
             for (int index = 0; index < this.queue.size(); ++index) {
                 long key = this.queue.getLong(index);
                 replacement.put(key, group);
+                if (this.frozenChunks.contains(key)) {
+                    group.frozen = true; // a group that contains a frozen chunk is frozen as a whole
+                }
                 // a chunk joining the group takes the highest delay of the members, so the group clock never runs ahead of any member;
                 // the chunk's pending ticks are shifted by the difference afterwards (remaining own ticks stay the same)
                 Group previous = this.memberGroup.get(key);
@@ -548,10 +766,16 @@ public final class RedstoneLimiterManager {
                     }
                 }
             }
+            if (group.frozen) {
+                // a group that merged with a frozen one is frozen as a whole, so all its members stay frozen when the slowdown ends
+                for (int index = 0; index < this.queue.size(); ++index) {
+                    this.frozenChunks.add(this.queue.getLong(index));
+                }
+            }
             for (int i = 0; i < this.shiftScratch.size(); i += 2) {
                 long delta = this.shiftScratch.getLong(i + 1) - group.lag;
                 if (delta != 0L) {
-                    this.pendingShift.addTo(this.shiftScratch.getLong(i), delta);
+                    this.addShift(this.shiftScratch.getLong(i), delta);
                 }
             }
             this.shiftScratch.clear();
@@ -563,7 +787,7 @@ public final class RedstoneLimiterManager {
         while (released.hasNext()) {
             var entry = released.next();
             if (!replacement.containsKey(entry.getLongKey()) && entry.getValue().lag > 0) {
-                this.pendingShift.addTo(entry.getLongKey(), entry.getValue().lag);
+                this.addShift(entry.getLongKey(), entry.getValue().lag);
             }
         }
         this.memberSpare = this.memberGroup;
@@ -611,7 +835,7 @@ public final class RedstoneLimiterManager {
         this.memberGroup.put(joining, group);
         long delta = -group.lag; // the joining chunk was on the server clock (lag 0), its pending ticks move to the group's clock
         if (delta != 0L) {
-            this.pendingShift.addTo(joining, delta);
+            this.addShift(joining, delta);
         }
         ChunkState state = this.chunks.get(joining);
         if (state == null) {
@@ -649,6 +873,9 @@ public final class RedstoneLimiterManager {
 
     public void removeChunk(long chunkKey) {
         this.coupledUntil.remove(chunkKey);
+        if (this.frozenChunks.remove(chunkKey)) {
+            this.groupsDirty = true; // the rebuild at the end of the tick drops the group when nothing is left of it (also without a slowdown)
+        }
         // an unloaded chunk leaves its group without a shift: its container is gone, and a stale member entry would make the next
         // rebuild shift a container that is loaded again later
         this.memberGroup.remove(chunkKey);
@@ -670,7 +897,7 @@ public final class RedstoneLimiterManager {
         while (members.hasNext()) {
             var entry = members.next();
             if (entry.getValue().lag > 0) {
-                this.pendingShift.addTo(entry.getLongKey(), entry.getValue().lag);
+                this.addShift(entry.getLongKey(), entry.getValue().lag);
             }
         }
         this.anySkipping = false;
@@ -686,6 +913,8 @@ public final class RedstoneLimiterManager {
         this.groupsDirty = false;
         this.wasVirtual = false;
         this.coupledUntil.clear();
+        this.frozenChunks.clear();
+        this.freezeTimer = 0;
         this.hasLag = false;
         this.msptEma = 0.0;
         this.overTicks = 0;
@@ -762,12 +991,14 @@ public final class RedstoneLimiterManager {
         private long lag;
         private double phase;
         private boolean skip;
+        private boolean frozen; // stands still completely, independent of the speed (see updateFreeze)
     }
 
     private static final class ChunkState {
         private final long chunkKey;
         private long tickNanos;
         private double emaMs;
+        private double rank; // scratch value of the scope "hottest" selection
         private long lastUpdate;
         private long lastActivity;
         private boolean hasUpdate;
