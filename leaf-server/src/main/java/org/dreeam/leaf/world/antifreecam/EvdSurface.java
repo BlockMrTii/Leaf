@@ -4,14 +4,25 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.Mth;
 import net.minecraft.util.SimpleBitStorage;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.levelgen.Heightmap;
 import org.jspecify.annotations.Nullable;
 
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Map;
+import java.util.function.Predicate;
 
 public final class EvdSurface {
+
+    // A solid layer that is at most this thick can be a floating build; anything thicker is taken as ground
+    private static final int FLOATING_CAP_MAX = 12;
+    // The filler fills the blocks below (surface - 16), so air above the ground is only filled if the ground lies more than 17 blocks down
+    private static final int FILLER_BUFFER = 17;
+
+    // the same test as the heightmap, so the layers are the ones the heightmap sees (leaves are not solid)
+    private static final Predicate<BlockState> SOLID = Heightmap.Types.MOTION_BLOCKING_NO_LEAVES.isOpaque();
 
     private EvdSurface() {}
 
@@ -44,7 +55,7 @@ public final class EvdSurface {
      * Preserved for backwards compatibility with existing callers.
      */
     public static @Nullable BitSet hiddenSections(ServerLevel level, Map<Heightmap.Types, long[]> rawHeightmaps) {
-        Result res = compute(level, rawHeightmaps);
+        Result res = compute(level, rawHeightmaps, null);
         return res != null ? res.hiddenSections() : null;
     }
 
@@ -64,13 +75,14 @@ public final class EvdSurface {
             }
         }
 
+        dropFloatingStructures(surfaceHeights, chunk.getSections(), chunk.getMinSectionY());
         return compute(chunk.getSectionsCount(), chunk.getMinSectionY(), surfaceHeights);
     }
 
     /**
      * Computes surface tile limits, fully hidden sections, and partially filled sections with cell masks from raw NBT heightmaps.
      */
-    public static @Nullable Result compute(ServerLevel level, Map<Heightmap.Types, long[]> rawHeightmaps) {
+    public static @Nullable Result compute(ServerLevel level, Map<Heightmap.Types, long[]> rawHeightmaps, LevelChunkSection @Nullable [] sections) {
         if (level == null || rawHeightmaps == null || level.dimensionType().hasCeiling()) {
             return null;
         }
@@ -99,7 +111,68 @@ public final class EvdSurface {
             surfaceHeights[i] = storage.get(i) + minY - 1;
         }
 
+        dropFloatingStructures(surfaceHeights, sections, level.getMinSectionY());
         return compute(level.getSectionsCount(), level.getMinSectionY(), surfaceHeights);
+    }
+
+    /**
+     * The heightmaps count anything that was built in the air as ground. Below a floating build the filler would then fill the air up to
+     * 16 blocks below it and leave a stone tower. Going down from the heightmap, thin solid layers (at most FLOATING_CAP_MAX thick, like a
+     * roof, a floor or a platform) and the air between them are skipped until a thick solid mass is found, which is the real ground.
+     * The surface is only lowered to it if that ground lies deeper than the filler buffer (more than 17 blocks), otherwise the filler would not reach the air
+     * anyway and a cave under a thin roof (or a small hollow) would be uncovered for nothing. A natural cavern deeper than the buffer
+     * under a thin roof is not told apart from a floating build, and a floating mass thicker than FLOATING_CAP_MAX still counts as ground.
+     */
+    static void dropFloatingStructures(int[] surfaceHeights, LevelChunkSection @Nullable [] sections, int minSectionY) {
+        if (sections == null) {
+            return;
+        }
+        final int minY = minSectionY << 4;
+        for (int z = 0; z < 16; z++) {
+            for (int x = 0; x < 16; x++) {
+                final int top = surfaceHeights[(z << 4) | x];
+                int y = top;
+                int ground = top;
+                while (y >= minY) {
+                    final int runTop = y;
+                    while (y >= minY && runTop - y <= FLOATING_CAP_MAX && isSolid(sections, minSectionY, x, y, z)) {
+                        y--; // stops as soon as the layer is known to be thick
+                    }
+                    if (runTop - y > FLOATING_CAP_MAX || y < minY) {
+                        ground = runTop; // a thick mass (or the world's bottom): the ground
+                        break;
+                    }
+                    // a thin layer: skip the air below it, whole empty sections at once
+                    while (y >= minY && !isSolid(sections, minSectionY, x, y, z)) {
+                        final int index = (y >> 4) - minSectionY;
+                        if (index >= 0 && index < sections.length && sections[index] != null && !sections[index].hasOnlyAir()) {
+                            y--;
+                        } else {
+                            y = ((y >> 4) << 4) - 1;
+                        }
+                    }
+                    if (y < minY) {
+                        ground = minY; // only thin layers over the void
+                        break;
+                    }
+                }
+                if (top - ground > FILLER_BUFFER) {
+                    surfaceHeights[(z << 4) | x] = ground;
+                }
+            }
+        }
+    }
+
+    private static boolean isSolid(LevelChunkSection[] sections, int minSectionY, int x, int y, int z) {
+        int index = (y >> 4) - minSectionY;
+        if (index < 0 || index >= sections.length) {
+            return false;
+        }
+        LevelChunkSection section = sections[index];
+        if (section == null || section.hasOnlyAir()) {
+            return false;
+        }
+        return SOLID.test(section.getBlockState(x, y & 15, z));
     }
 
     /**
