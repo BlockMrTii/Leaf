@@ -193,7 +193,7 @@ public final class FarChunkPacketBuilder {
 
             boolean antiFreecamEnabled = AntiFreecam.isEnabled(world);
             Map<Heightmap.Types, long[]> rawHeightmaps = data.heightmaps();
-            EvdSurface.Result surfaceResult = antiFreecamEnabled ? EvdSurface.compute(world, rawHeightmaps) : null;
+            EvdSurface.Result surfaceResult = antiFreecamEnabled ? EvdSurface.compute(world, rawHeightmaps, sections) : null;
             BitSet hiddenSections = surfaceResult != null ? surfaceResult.hiddenSections() : null;
 
             // 5. Block Entities (only if configured, up to BLOCK_ENTITY_LIMIT)
